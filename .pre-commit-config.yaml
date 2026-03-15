@@ -1,0 +1,30 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.5.7
+    hooks:
+      - id: ruff
+      - id: ruff-format
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.11.1
+    hooks:
+      - id: mypy
+        args: ["--config-file=pyproject.toml"]
+        additional_dependencies: []
+  - repo: https://github.com/numpy/numpydoc
+    rev: v1.8.0
+    hooks:
+      - id: numpydoc-validation
+        exclude: .*/__init__\.py$|.*/config\.py$
+  - repo: local
+    hooks:
+      - id: uv-lock
+        name: Lock dependencies with uv
+        entry: uv lock
+        language: system
+        pass_filenames: false
