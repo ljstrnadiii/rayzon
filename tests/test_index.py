@@ -1,8 +1,5 @@
-from affine import Affine
-
 from rzzs.grid import GridSpec
 from rzzs.index import build_feature_chunk_index_from_chunk_to_features, plan_chunk_jobs
-from rzzs.types import ChunkId, FeatureId
 
 
 def _grid() -> GridSpec:
@@ -10,7 +7,7 @@ def _grid() -> GridSpec:
         dims=("y", "x"),
         shape=(100, 100),
         chunk_sizes=(10, 10),
-        transform=Affine(1, 0, 0, 0, -1, 100),
+        transform=(1.0, 0.0, 0.0, 0.0, -1.0, 100.0),
         crs="EPSG:4326",
         x_dim="x",
         y_dim="y",
@@ -18,7 +15,7 @@ def _grid() -> GridSpec:
 
 
 def test_build_feature_chunk_index_from_chunk_to_features() -> None:
-    chunk_to_features: dict[ChunkId, list[FeatureId]] = {
+    chunk_to_features: dict[tuple[int, ...], list[int | str]] = {
         (0, 0): ["a", "b"],
         (0, 1): ["a"],
     }
@@ -30,7 +27,7 @@ def test_build_feature_chunk_index_from_chunk_to_features() -> None:
 
 
 def test_plan_chunk_jobs_sorted() -> None:
-    chunk_to_features: dict[ChunkId, list[FeatureId]] = {
+    chunk_to_features: dict[tuple[int, ...], list[int | str]] = {
         (0, 1): ["a"],
         (0, 0): ["a"],
     }

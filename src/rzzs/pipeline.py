@@ -1,41 +1,24 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
+import pyproj
 import ray.data
+from affine import Affine
 
-from rzzs.config import BenchmarkConfig, ZonalStatsConfig
-from rzzs.grid import GridSpec
-from rzzs.index import (
-    ChunkFeatureIndex,
-    _group_chunk_feature_rows,
-    _map_feature_batch_to_chunk_rows,
-    build_chunk_to_features_from_grouped_rows,
-    build_feature_chunk_index_from_chunk_to_features,
-    plan_chunk_jobs,
-)
+from rzzs.arrow import geodataframe_to_geoarrow_table
+from rzzs.chunk_processor import process_chunk_group
+from rzzs.index import map_feature_to_chunk_rows
 from rzzs.rasterize_backend import RasterizeBackend
-from rzzs.stats import DEFAULT_STAT_EXPRS, resolve_stat_exprs
-from rzzs.types import ChunkJob
-from rzzs.zarr_backend import ZarrBackend, build_grid_spec_from_mosaic
+from rzzs.stats import DEFAULT_STAT_EXPRS, build_aggregations, resolve_stat_exprs
+from rzzs.types import COL_CHUNK_KEY, COL_FEATURE_ID, COL_GEOMETRY
+from rzzs.zarr_backend import ZarrBackend, build_grid_spec, resolve_dim_coords
 
 if TYPE_CHECKING:
     import geopandas as gpd
-
-
-@dataclass(frozen=True)
-class PipelinePlan:
-    grid_spec: GridSpec
-    feature_index: ChunkFeatureIndex
-    chunk_jobs: list[ChunkJob]
-
-
-def geodataframe_to_geoarrow_table(frame: gpd.GeoDataFrame) -> pa.Table:
-    return pa.table(frame.to_arrow())
 
 
 def to_feature_dataset(
@@ -62,120 +45,165 @@ def to_feature_dataset(
     raise TypeError("feature_source must be a Ray Dataset, GeoDataFrame, or parquet path")
 
 
-def build_feature_chunk_index(
-    feature_source: ray.data.Dataset,
-    grid_spec: GridSpec,
-    *,
-    feature_id_col: str = "feature_id",
-) -> ChunkFeatureIndex:
-    results = (
-        feature_source.map_batches(
-            _map_feature_batch_to_chunk_rows,  # type: ignore[arg-type]
-            fn_kwargs={"grid_spec": grid_spec, "feature_id_col": feature_id_col},
-            batch_format="pyarrow",
-        )
-        .groupby("chunk_key")
-        .map_groups(
-            _group_chunk_feature_rows,  # type: ignore[arg-type]
-            batch_format="pyarrow",
-        )
-    )
-
-    chunk_to_features = build_chunk_to_features_from_grouped_rows(results.take_all())
-    return build_feature_chunk_index_from_chunk_to_features(chunk_to_features)
-
-
-def build_pipeline_plan(
-    mosaic: str,
+def zonal_stats(
+    store_uri: str,
     features: gpd.GeoDataFrame | str | Path | ray.data.Dataset,
     *,
-    config: ZonalStatsConfig,
-    zarr_backend: ZarrBackend = ZarrBackend.ZARR_PYTHON,
-) -> PipelinePlan:
-    grid_spec = build_grid_spec_from_mosaic(
-        mosaic,
-        x_dim=config.x_dim,
-        y_dim=config.y_dim,
-        dst_crs=config.dst_crs,
-        zarr_backend=zarr_backend,
-    )
-    feature_dataset = to_feature_dataset(features)
-    feature_index = build_feature_chunk_index(feature_dataset, grid_spec)
-    chunk_jobs = plan_chunk_jobs(feature_index)
-
-    return PipelinePlan(
-        grid_spec=grid_spec,
-        feature_index=feature_index,
-        chunk_jobs=chunk_jobs,
-    )
-
-
-def run_zonal_stats(
-    mosaic: str,
-    features: gpd.GeoDataFrame | str | Path | ray.data.Dataset,
-    *,
-    reduce_dims: Sequence[str],
+    transform: Affine,
+    crs: pyproj.CRS,
+    x_dim: str = "x",
+    y_dim: str = "y",
     stats: Sequence[str] = DEFAULT_STAT_EXPRS,
-    config: ZonalStatsConfig,
-    output_uri: str,
+    array_name: str | None = None,
+    all_touched: bool = False,
+    nodata: float | int | None = None,
+    decode_coords: bool = False,
     zarr_backend: ZarrBackend = ZarrBackend.ZARR_PYTHON,
     rasterize_backend: RasterizeBackend = RasterizeBackend.RASTERIO,
-) -> str:
-    """Run zonal statistics for a mosaic over vector features.
+) -> ray.data.Dataset:
+    """Compute zonal statistics over a zarr array for a set of geometries.
 
     Parameters
     ----------
-    mosaic : str
-        Store URI for the mosaic group. Default backend assumes a zarr group
-        opened from an obstore-compatible store.
-    features : geopandas.GeoDataFrame | str | pathlib.Path | ray.data.Dataset
-        Feature source as a GeoDataFrame or a parquet path readable by Ray.
-    reduce_dims : collections.abc.Sequence[str]
-        Dimensions to reduce across.
-    stats : collections.abc.Sequence[str]
-        Optional stat expressions. When omitted, defaults to
-        ('count', 'n_valid', 'mean', 'std').
-    config : rzzs.config.ZonalStatsConfig
-        Pipeline configuration.
-    output_uri : str
-        Output parquet sink URI.
-    zarr_backend : rzzs.zarr_backend.ZarrBackend
-        Zarr backend identifier. Defaults to zarr-python.
-    rasterize_backend : rzzs.rasterize_backend.RasterizeBackend
-        Rasterization backend identifier. Defaults to rasterio.
+    store_uri : str
+        URI of the zarr store.  For a standalone zarr array, point directly
+        at the array.  For a zarr group (e.g. written by xarray), point at
+        the group root and set *array_name*.
+    features : GeoDataFrame | str | Path | ray.data.Dataset
+        Geometries to compute statistics for. Must be in the same CRS as
+        *crs*.
+    transform : Affine
+        Affine transform mapping pixel coordinates to the CRS.
+    crs : pyproj.CRS
+        Coordinate reference system of the raster data.
+    x_dim, y_dim : str
+        Names of the spatial dimensions in the zarr array.
+    stats : Sequence[str]
+        Stat expressions to compute, e.g. ``("count", "mean", "std")``.
+    array_name : str | None
+        Name of the array within a zarr group.  ``None`` when *store_uri*
+        already points at a standalone array.
+    all_touched : bool
+        If True, all pixels touched by a geometry are included.
+    nodata : float | int | None
+        Pixel value to treat as missing (replaced with NaN before stats).
+    decode_coords : bool
+        If True, use xarray to decode coordinate values for non-spatial
+        dimensions.  Requires the ``xarray`` extra.
+    zarr_backend : ZarrBackend
+        Backend for reading zarr data.
+    rasterize_backend : RasterizeBackend
+        Backend for rasterizing geometries.
+
+    Returns
+    -------
+    ray.data.Dataset
+        One row per (feature, non-spatial dim combination) with the requested
+        stat columns.
     """
+    resolved = resolve_stat_exprs(list(stats))
+    transform_tuple = (transform.a, transform.b, transform.c, transform.d, transform.e, transform.f)
+    crs_wkt = crs.to_wkt()
 
-    resolved_stats = resolve_stat_exprs(list(stats))
-
-    plan = build_pipeline_plan(
-        mosaic,
-        features,
-        config=config,
+    grid_spec, pixel_dtype, scale_factor, add_offset = build_grid_spec(
+        store_uri,
+        x_dim=x_dim,
+        y_dim=y_dim,
+        transform=transform_tuple,
+        crs=crs_wkt,
+        array_name=array_name,
         zarr_backend=zarr_backend,
     )
-    _ = plan, reduce_dims, resolved_stats, output_uri, rasterize_backend
-    raise NotImplementedError(
-        "Planning is implemented; chunk execution and final reduce/write are not implemented yet."
+    non_spatial_dims = [dim for dim in grid_spec.dims if dim not in (y_dim, x_dim)]
+
+    dim_coord_values: dict[str, list] = {}
+    if decode_coords and non_spatial_dims:
+        dim_coord_values = resolve_dim_coords(
+            store_uri,
+            dims=grid_spec.dims,
+            x_dim=x_dim,
+            y_dim=y_dim,
+            array_name=array_name,
+        )
+
+    _check_feature_crs(features, crs)
+    feature_ds = to_feature_dataset(features)
+    feature_id_pa_type = _detect_feature_id_type(feature_ds)
+
+    grid_kwargs: dict[str, object] = {
+        "dims": list(grid_spec.dims),
+        "shape": list(grid_spec.shape),
+        "chunk_sizes": list(grid_spec.chunk_sizes),
+        "transform_coeffs": list(grid_spec.transform),
+        "crs": grid_spec.crs,
+        "x_dim": x_dim,
+        "y_dim": y_dim,
+    }
+    chunk_kwargs = {
+        "store_uri": store_uri,
+        "array_name": array_name or "",
+        "all_touched": all_touched,
+        "nodata": nodata,
+        "zarr_backend_value": zarr_backend.value,
+        "rasterize_backend_value": rasterize_backend.value,
+        "pixel_numpy_dtype": str(pixel_dtype),
+        "feature_id_pa_type": str(feature_id_pa_type),
+        "scale_factor": scale_factor,
+        "add_offset": add_offset,
+        "dim_coord_values": dim_coord_values,
+        **grid_kwargs,
+    }
+
+    group_keys = [COL_FEATURE_ID] + non_spatial_dims
+    aggs = build_aggregations(resolved)
+
+    return (
+        feature_ds.map_batches(
+            map_feature_to_chunk_rows,  # type: ignore[arg-type]
+            fn_kwargs={
+                "feature_id_col": COL_FEATURE_ID,
+                "geometry_col": COL_GEOMETRY,
+                **grid_kwargs,
+            },
+            batch_format="pyarrow",
+        )
+        .groupby(COL_CHUNK_KEY)
+        .map_groups(
+            process_chunk_group,  # type: ignore[arg-type]
+            fn_kwargs=chunk_kwargs,
+            batch_format="pyarrow",
+        )
+        .groupby(group_keys)
+        .aggregate(*aggs)
     )
 
 
-def run_benchmark(
-    mosaic: str,
+def _detect_feature_id_type(ds: ray.data.Dataset) -> pa.DataType:
+    schema = ds.schema()
+    if schema is not None and hasattr(schema, "field"):
+        try:
+            return schema.field(COL_FEATURE_ID).type
+        except (KeyError, AttributeError):
+            pass
+    return pa.string()
+
+
+def _check_feature_crs(
     features: gpd.GeoDataFrame | str | Path | ray.data.Dataset,
-    *,
-    benchmark_config: BenchmarkConfig,
-) -> dict[str, float | int]:
-    """Run the benchmark harness for the configured workload.
-
-    Parameters
-    ----------
-    mosaic : str
-        Store URI for the mosaic group.
-    features : geopandas.GeoDataFrame | str | pathlib.Path | ray.data.Dataset
-        Feature source as a GeoDataFrame or a parquet path readable by Ray.
-    benchmark_config : rzzs.config.BenchmarkConfig
-        Benchmark execution configuration.
-    """
-
-    _ = mosaic, features, benchmark_config
-    raise NotImplementedError("run_benchmark will be implemented in benchmark phase")
+    crs: pyproj.CRS,
+) -> None:
+    try:
+        import geopandas  # noqa: F811
+    except ImportError:
+        return
+    if not isinstance(features, geopandas.GeoDataFrame):
+        return
+    if features.crs is None:
+        return
+    feature_crs = pyproj.CRS(features.crs)
+    if not feature_crs.equals(crs):
+        raise ValueError(
+            f"Feature CRS ({feature_crs.to_epsg() or feature_crs.to_wkt()}) does not match "
+            f"the raster CRS ({crs.to_epsg() or crs.to_wkt()}). "
+            "Reproject your features to match the raster CRS before calling zonal_stats."
+        )

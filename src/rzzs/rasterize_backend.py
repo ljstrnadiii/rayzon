@@ -10,8 +10,6 @@ from numpy.typing import NDArray
 from rasterio.features import rasterize
 from shapely.geometry.base import BaseGeometry
 
-from rzzs.types import AffineLike
-
 
 class RasterizeBackend(StrEnum):
     RASTERIO = "rasterio"
@@ -20,9 +18,9 @@ class RasterizeBackend(StrEnum):
 class RasterizeWindowBackend(Protocol):
     def __call__(
         self,
-        polygon: BaseGeometry,
+        geometry: BaseGeometry,
         out_shape: tuple[int, int],
-        transform: AffineLike,
+        transform: Affine | tuple[float, ...] | list[float] | NDArray[np.floating],
         all_touched: bool = False,
     ) -> NDArray[np.bool_]: ...
 
@@ -30,14 +28,14 @@ class RasterizeWindowBackend(Protocol):
 class _RasterioWindowBackend:
     def __call__(
         self,
-        polygon: BaseGeometry,
+        geometry: BaseGeometry,
         out_shape: tuple[int, int],
-        transform: AffineLike,
+        transform: Affine | tuple[float, ...] | list[float] | NDArray[np.floating],
         all_touched: bool = False,
     ) -> NDArray[np.bool_]:
         affine_transform = _coerce_affine(transform)
         mask = rasterize(
-            [(polygon, 1)],
+            [(geometry, 1)],
             out_shape=out_shape,
             transform=affine_transform,
             fill=0,
@@ -47,17 +45,17 @@ class _RasterioWindowBackend:
         return cast(NDArray[np.bool_], np.asarray(mask, dtype=bool))
 
 
-def rasterize_polygon_window(
-    polygon: BaseGeometry,
+def rasterize_geometry_window(
+    geometry: BaseGeometry,
     out_shape: tuple[int, int],
-    transform: AffineLike,
+    transform: Affine | tuple[float, ...] | list[float] | NDArray[np.floating],
     all_touched: bool = False,
     rasterize_backend: RasterizeBackend = RasterizeBackend.RASTERIO,
 ) -> NDArray[np.bool_]:
     match rasterize_backend:
         case RasterizeBackend.RASTERIO:
             return _RasterioWindowBackend()(
-                polygon,
+                geometry,
                 out_shape,
                 transform,
                 all_touched=all_touched,
@@ -66,7 +64,9 @@ def rasterize_polygon_window(
             raise ValueError(f"Unsupported rasterize backend: {rasterize_backend}")
 
 
-def _coerce_affine(transform: AffineLike) -> Affine:
+def _coerce_affine(
+    transform: Affine | tuple[float, ...] | list[float] | NDArray[np.floating],
+) -> Affine:
     if isinstance(transform, Affine):
         return transform
 

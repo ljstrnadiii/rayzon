@@ -1754,7 +1754,6 @@ dependencies = [
     { name = "rasterio", version = "1.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "ray", extra = ["data"] },
     { name = "shapely" },
-    { name = "xarray" },
     { name = "zarr" },
 ]
 
@@ -1768,9 +1767,13 @@ dev = [
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "ruff" },
+    { name = "xarray" },
 ]
 geopandas = [
     { name = "geopandas" },
+]
+xarray = [
+    { name = "xarray" },
 ]
 
 [package.metadata]
@@ -1793,10 +1796,11 @@ requires-dist = [
     { name = "ray", extras = ["data"], specifier = ">=2.30.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5.0" },
     { name = "shapely", specifier = ">=2.0.0" },
-    { name = "xarray", specifier = ">=2024.2.0" },
+    { name = "xarray", marker = "extra == 'dev'", specifier = ">=2024.2.0" },
+    { name = "xarray", marker = "extra == 'xarray'", specifier = ">=2024.2.0" },
     { name = "zarr", specifier = ">=2.18.0" },
 ]
-provides-extras = ["geopandas", "dev"]
+provides-extras = ["geopandas", "xarray", "dev"]
 
 [[package]]
 name = "shapely"

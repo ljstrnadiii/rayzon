@@ -5,16 +5,14 @@ from dataclasses import dataclass
 
 from affine import Affine
 
-from rzzs.types import ChunkId
-
 
 @dataclass(frozen=True)
 class GridSpec:
     dims: tuple[str, ...]
     shape: tuple[int, ...]
     chunk_sizes: tuple[int, ...]
-    transform: Affine
-    crs: str | None
+    transform: tuple[float, float, float, float, float, float]
+    crs: str
     x_dim: str
     y_dim: str
 
@@ -36,7 +34,7 @@ class GridSpec:
         return tuple(math.ceil(s / c) for s, c in zip(self.shape, self.chunk_sizes, strict=True))
 
 
-def chunk_id_to_slices(chunk_id: ChunkId, grid: GridSpec) -> tuple[slice, ...]:
+def chunk_id_to_slices(chunk_id: tuple[int, ...], grid: GridSpec) -> tuple[slice, ...]:
     if len(chunk_id) != len(grid.dims):
         raise ValueError("chunk_id rank must match grid dims")
 
@@ -54,7 +52,7 @@ def chunk_id_to_slices(chunk_id: ChunkId, grid: GridSpec) -> tuple[slice, ...]:
     return tuple(slices)
 
 
-def chunk_pixel_bounds_xy(chunk_id: ChunkId, grid: GridSpec) -> tuple[int, int, int, int]:
+def chunk_pixel_bounds_xy(chunk_id: tuple[int, ...], grid: GridSpec) -> tuple[int, int, int, int]:
     slices = chunk_id_to_slices(chunk_id, grid)
     ys = slices[grid.y_index]
     xs = slices[grid.x_index]
@@ -62,11 +60,13 @@ def chunk_pixel_bounds_xy(chunk_id: ChunkId, grid: GridSpec) -> tuple[int, int, 
 
 
 def pixel_to_world(x: float, y: float, grid: GridSpec) -> tuple[float, float]:
-    wx, wy = grid.transform * (x, y)
+    wx, wy = Affine(*grid.transform) * (x, y)
     return float(wx), float(wy)
 
 
-def chunk_world_bounds(chunk_id: ChunkId, grid: GridSpec) -> tuple[float, float, float, float]:
+def chunk_world_bounds(
+    chunk_id: tuple[int, ...], grid: GridSpec
+) -> tuple[float, float, float, float]:
     x0, y0, x1, y1 = chunk_pixel_bounds_xy(chunk_id, grid)
     c00 = pixel_to_world(x0, y0, grid)
     c10 = pixel_to_world(x1, y0, grid)
@@ -83,7 +83,7 @@ def world_bbox_to_chunk_ranges(
     grid: GridSpec,
 ) -> tuple[range, range]:
     minx, miny, maxx, maxy = bbox
-    inv = ~grid.transform
+    inv = ~Affine(*grid.transform)
 
     px0, py0 = inv * (minx, maxy)
     px1, py1 = inv * (maxx, miny)
@@ -101,3 +101,31 @@ def world_bbox_to_chunk_ranges(
     y_chunk_stop = math.ceil(y_max / cy)
 
     return range(y_chunk_start, y_chunk_stop), range(x_chunk_start, x_chunk_stop)
+
+
+def reconstruct_grid_spec(
+    *,
+    dims: list[str],
+    shape: list[int],
+    chunk_sizes: list[int],
+    transform_coeffs: list[float],
+    crs: str,
+    x_dim: str,
+    y_dim: str,
+) -> GridSpec:
+    return GridSpec(
+        dims=tuple(dims),
+        shape=tuple(shape),
+        chunk_sizes=tuple(chunk_sizes),
+        transform=(
+            transform_coeffs[0],
+            transform_coeffs[1],
+            transform_coeffs[2],
+            transform_coeffs[3],
+            transform_coeffs[4],
+            transform_coeffs[5],
+        ),
+        crs=crs,
+        x_dim=x_dim,
+        y_dim=y_dim,
+    )

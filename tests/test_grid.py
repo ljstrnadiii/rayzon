@@ -1,5 +1,3 @@
-from affine import Affine
-
 from rzzs.grid import (
     GridSpec,
     chunk_id_to_slices,
@@ -13,7 +11,7 @@ def _grid() -> GridSpec:
         dims=("time", "band", "y", "x"),
         shape=(10, 2, 100, 100),
         chunk_sizes=(5, 1, 10, 10),
-        transform=Affine(1, 0, 0, 0, -1, 100),
+        transform=(1.0, 0.0, 0.0, 0.0, -1.0, 100.0),
         crs="EPSG:4326",
         x_dim="x",
         y_dim="y",

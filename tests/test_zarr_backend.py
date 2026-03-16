@@ -9,10 +9,10 @@ import xarray as xr
 import zarr
 from zarr.storage import ObjectStore
 
-from rzzs.zarr_backend import ZarrBackend, build_grid_spec_from_mosaic, get_obstore
+from rzzs.zarr_backend import ZarrBackend, build_grid_spec, get_obstore
 
 
-def test_build_grid_spec_from_mosaic_array_path(tmp_path: Path) -> None:
+def test_build_grid_spec_standalone_array(tmp_path: Path) -> None:
     path = tmp_path / "mosaic-array.zarr"
 
     array = zarr.open_array(
@@ -27,14 +27,21 @@ def test_build_grid_spec_from_mosaic_array_path(tmp_path: Path) -> None:
     array.attrs["transform"] = [1.0, 0.0, 0.0, 0.0, -1.0, 100.0]
     array.attrs["crs"] = "EPSG:4326"
 
-    grid = build_grid_spec_from_mosaic(str(path), x_dim="x", y_dim="y")
+    grid, pixel_dtype, _, _ = build_grid_spec(
+        str(path),
+        x_dim="x",
+        y_dim="y",
+        transform=(1.0, 0.0, 0.0, 0.0, -1.0, 100.0),
+        crs="EPSG:4326",
+    )
     assert grid.dims == ("time", "y", "x")
     assert grid.shape == (10, 100, 100)
     assert grid.chunk_sizes == (5, 10, 10)
     assert grid.crs == "EPSG:4326"
+    assert pixel_dtype == np.float32
 
 
-def test_build_grid_spec_from_mosaic_group_data_key(tmp_path: Path) -> None:
+def test_build_grid_spec_group_with_array_name(tmp_path: Path) -> None:
     root = zarr.open_group(str(tmp_path / "mosaic-group.zarr"), mode="w", zarr_format=3)
     root.create_array(
         "data",
@@ -44,7 +51,14 @@ def test_build_grid_spec_from_mosaic_group_data_key(tmp_path: Path) -> None:
         dimension_names=("y", "x"),
     )
 
-    grid = build_grid_spec_from_mosaic(str(tmp_path / "mosaic-group.zarr"), x_dim="x", y_dim="y")
+    grid, *_ = build_grid_spec(
+        str(tmp_path / "mosaic-group.zarr"),
+        x_dim="x",
+        y_dim="y",
+        transform=(1.0, 0.0, 0.0, 0.0, -1.0, 100.0),
+        crs="EPSG:4326",
+        array_name="data",
+    )
     assert grid.dims == ("y", "x")
     assert grid.chunk_sizes == (10, 10)
 
@@ -71,7 +85,14 @@ def test_build_grid_spec_from_xarray_written_zarr_v3(tmp_path: Path) -> None:
 
     data.to_zarr(str(path), mode="w", zarr_format=3)
 
-    grid = build_grid_spec_from_mosaic(str(path), x_dim="x", y_dim="y", array_path="data")
+    grid, *_ = build_grid_spec(
+        str(path),
+        x_dim="x",
+        y_dim="y",
+        array_name="data",
+        transform=(1.0, 0.0, 0.0, 0.0, -1.0, 20.0),
+        crs="EPSG:4326",
+    )
     assert grid.dims == ("time", "y", "x")
     assert grid.shape == (3, 20, 30)
 
@@ -89,9 +110,11 @@ def test_build_grid_spec_rejects_unknown_backend(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="Unsupported zarr backend"):
-        build_grid_spec_from_mosaic(
+        build_grid_spec(
             str(path),
             x_dim="x",
             y_dim="y",
+            transform=(1.0, 0.0, 0.0, 0.0, -1.0, 10.0),
+            crs="EPSG:4326",
             zarr_backend=cast(ZarrBackend, "unknown"),
         )
