@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from typing import TypeAlias
 
 import pyarrow as pa
 from shapely import from_wkb
@@ -10,6 +11,10 @@ from shapely.geometry.base import BaseGeometry
 
 from rzzs.grid import GridSpec, world_bbox_to_chunk_ranges
 from rzzs.types import ChunkId, ChunkJob, FeatureId
+
+GroupedRow: TypeAlias = dict[str, str | list[FeatureId]]
+BBoxLike: TypeAlias = Mapping[str, float] | Sequence[float]
+GeometryLike: TypeAlias = BaseGeometry | bytes | bytearray | memoryview
 
 
 @dataclass(frozen=True)
@@ -45,7 +50,7 @@ def _build_chunk_id_for_xy(chunk_y: int, chunk_x: int, grid: GridSpec) -> ChunkI
 
 
 def build_chunk_to_features_from_grouped_rows(
-    grouped_rows: list[dict[str, object]],
+    grouped_rows: list[GroupedRow],
 ) -> dict[ChunkId, list[FeatureId]]:
     chunk_to_features: dict[ChunkId, list[FeatureId]] = {}
     for row in grouped_rows:
@@ -148,7 +153,7 @@ def _iter_normalized_feature_rows_from_arrow(
     raise KeyError("Feature input must include bbox columns, bbox struct, or geometry")
 
 
-def _coerce_arrow_table(batch: object) -> pa.Table:
+def _coerce_arrow_table(batch: pa.Table | pa.RecordBatch) -> pa.Table:
     if isinstance(batch, pa.Table):
         return batch
     if isinstance(batch, pa.RecordBatch):
@@ -176,14 +181,14 @@ def _chunk_key_to_chunk_id(chunk_key: str) -> ChunkId:
     return tuple(int(part) for part in chunk_key.split(","))
 
 
-def _normalize_feature_id(value: object) -> FeatureId:
+def _normalize_feature_id(value: FeatureId) -> FeatureId:
     if isinstance(value, int | str):
         return value
     raise TypeError("feature_id values must be int or str")
 
 
-def _bbox_to_tuple(value: object) -> tuple[float, float, float, float]:
-    if isinstance(value, dict):
+def _bbox_to_tuple(value: BBoxLike) -> tuple[float, float, float, float]:
+    if isinstance(value, Mapping):
         return (
             float(value["xmin"]),
             float(value["ymin"]),
@@ -196,7 +201,7 @@ def _bbox_to_tuple(value: object) -> tuple[float, float, float, float]:
     raise TypeError("bbox values must be dict-like with xmin/ymin/xmax/ymax")
 
 
-def _normalize_geometry_value(value: object) -> BaseGeometry:
+def _normalize_geometry_value(value: GeometryLike) -> BaseGeometry:
     if isinstance(value, BaseGeometry):
         return value
     if isinstance(value, bytes | bytearray | memoryview):

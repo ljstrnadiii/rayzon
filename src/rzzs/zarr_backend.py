@@ -4,7 +4,7 @@ import os
 from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 from urllib.parse import urlparse
 
 import zarr
@@ -31,6 +31,10 @@ class _ZarrPythonArrayBackend:
 _ARRAY_BACKENDS: dict[ZarrBackend, ZarrArrayBackend] = {
     ZarrBackend.ZARR_PYTHON: _ZarrPythonArrayBackend(),
 }
+
+RawDims = Sequence[str] | None
+AttrValue = int | float | str | Mapping[str, Any] | Sequence[Any] | None
+Attrs = Mapping[str, AttrValue]
 
 
 def build_grid_spec_from_mosaic(
@@ -109,13 +113,13 @@ def _normalize_chunk_sizes(chunks: Sequence[int] | None, shape: tuple[int, ...])
 
 
 def _resolve_dims(
-    raw_dims: object,
+    raw_dims: RawDims,
     *,
     rank: int,
     x_dim: str,
     y_dim: str,
 ) -> tuple[str, ...]:
-    if isinstance(raw_dims, list | tuple):
+    if raw_dims is not None:
         dims = tuple(str(value) for value in raw_dims)
         if len(dims) != rank:
             raise ValueError("_ARRAY_DIMENSIONS rank does not match array rank")
@@ -131,29 +135,32 @@ def _resolve_dims(
     return dims
 
 
-def _resolve_raw_dims(array: zarr.Array, attrs: Mapping[str, object]) -> object:
+def _resolve_raw_dims(array: zarr.Array, attrs: Attrs) -> RawDims:
     metadata = getattr(array, "metadata", None)
     if metadata is not None:
         dimension_names = getattr(metadata, "dimension_names", None)
         if isinstance(dimension_names, tuple | list):
             return dimension_names
-    return attrs.get("_ARRAY_DIMENSIONS")
+    attr_dims = attrs.get("_ARRAY_DIMENSIONS")
+    if isinstance(attr_dims, list | tuple):
+        return tuple(str(value) for value in attr_dims)
+    return None
 
 
-def _resolve_transform(raw_transform: object) -> Affine:
+def _resolve_transform(raw_transform: AttrValue) -> Affine:
     if isinstance(raw_transform, list | tuple) and len(raw_transform) == 6:
         values = tuple(float(value) for value in raw_transform)
         return Affine(*values)
     return Affine.identity()
 
 
-def _resolve_crs(raw_crs: object) -> str | None:
+def _resolve_crs(raw_crs: AttrValue) -> str | None:
     if raw_crs is None:
         return None
     return str(raw_crs)
 
 
-def _as_array(value: object) -> zarr.Array:
+def _as_array(value: Any) -> zarr.Array:
     if isinstance(value, zarr.Array):
         return value
     raise TypeError("Resolved zarr node is not an array")
