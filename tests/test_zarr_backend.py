@@ -7,9 +7,8 @@ import numpy as np
 import pytest
 import xarray as xr
 import zarr
+from rayzon.zarr_backend import ZarrBackend, build_grid_spec, get_obstore
 from zarr.storage import ObjectStore
-
-from rzzs.zarr_backend import ZarrBackend, build_grid_spec, get_obstore
 
 
 def test_build_grid_spec_standalone_array(tmp_path: Path) -> None:

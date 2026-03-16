@@ -3,13 +3,13 @@ requires = ["hatchling>=1.26.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "rzzs"
+name = "rayzon"
 version = "0.1.0a0"
 description = "Chunk-first zonal statistics for xarray mosaics and GeoPandas using Ray"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 license = { text = "MIT" }
-authors = [{ name = "rzzs contributors" }]
+authors = [{ name = "rayzon contributors" }]
 dependencies = [
   "affine>=2.4.0",
   "numpy>=1.26.0",
@@ -43,7 +43,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/rzzs"]
+packages = ["src/rayzon"]
 
 [tool.ruff]
 line-length = 100

@@ -1,6 +1,5 @@
 import pytest
-
-from rzzs.stats import normalize_stat_expr, resolve_stat_exprs
+from rayzon.stats import normalize_stat_expr, resolve_stat_exprs
 
 
 def test_normalize_stat_expr_builtin() -> None:

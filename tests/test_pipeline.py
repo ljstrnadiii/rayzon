@@ -6,14 +6,13 @@ import pandas as pd
 import pyproj
 import zarr
 from affine import Affine
-from shapely.geometry import Point, box
-
-from rzzs.arrow import as_table, geodataframe_to_geoarrow_table
-from rzzs.pipeline import (
+from rayzon.arrow import as_table, geodataframe_to_geoarrow_table
+from rayzon.pipeline import (
     to_feature_dataset,
     zonal_stats,
 )
-from rzzs.types import COL_FEATURE_ID
+from rayzon.types import COL_FEATURE_ID
+from shapely.geometry import Point, box
 
 
 def _gdf() -> gpd.GeoDataFrame:

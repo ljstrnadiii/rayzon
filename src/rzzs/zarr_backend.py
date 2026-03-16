@@ -10,9 +10,8 @@ from urllib.parse import urlparse
 import numpy as np
 import zarr
 from obstore.store import LocalStore, S3Store
+from rayzon.grid import GridSpec
 from zarr.storage import ObjectStore
-
-from rzzs.grid import GridSpec
 
 
 class ZarrBackend(StrEnum):
@@ -166,8 +165,8 @@ def resolve_dim_coords(
         raise ImportError(
             "decode_coords requires xarray. "
             "Install with the 'xarray' extra, for example "
-            '`pip install "rzzs[xarray]"` or '
-            '`uv pip install "rzzs[xarray]"`.'
+            '`pip install "rayzon[xarray]"` or '
+            '`uv pip install "rayzon[xarray]"`.'
         ) from exc
 
     non_spatial = [d for d in dims if d not in (x_dim, y_dim)]

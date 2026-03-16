@@ -4,9 +4,8 @@ from typing import cast
 
 import numpy as np
 import pytest
+from rayzon.rasterize_backend import RasterizeBackend, rasterize_geometry_window
 from shapely.geometry import box
-
-from rzzs.rasterize_backend import RasterizeBackend, rasterize_geometry_window
 
 
 def test_rasterize_geometry_window_accepts_numpy_transform() -> None:

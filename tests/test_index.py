@@ -1,5 +1,5 @@
-from rzzs.grid import GridSpec
-from rzzs.index import build_feature_chunk_index_from_chunk_to_features, plan_chunk_jobs
+from rayzon.grid import GridSpec
+from rayzon.index import build_feature_chunk_index_from_chunk_to_features, plan_chunk_jobs
 
 
 def _grid() -> GridSpec:

@@ -6,15 +6,14 @@ import numpy as np
 import pyarrow as pa
 import zarr
 from affine import Affine
+from rayzon.arrow import as_table
+from rayzon.grid import GridSpec, chunk_id_to_slices, chunk_world_bounds, reconstruct_grid_spec
+from rayzon.index import _chunk_key_to_chunk_id, _normalize_feature_id
+from rayzon.rasterize_backend import RasterizeBackend, rasterize_geometry_window
+from rayzon.types import COL_CHUNK_KEY, COL_FEATURE_ID, COL_GEOMETRY, COL_PIXELS, PartialRow
+from rayzon.zarr_backend import ZarrBackend, open_zarr_array
 from shapely import from_wkb
 from shapely.geometry.base import BaseGeometry
-
-from rzzs.arrow import as_table
-from rzzs.grid import GridSpec, chunk_id_to_slices, chunk_world_bounds, reconstruct_grid_spec
-from rzzs.index import _chunk_key_to_chunk_id, _normalize_feature_id
-from rzzs.rasterize_backend import RasterizeBackend, rasterize_geometry_window
-from rzzs.types import COL_CHUNK_KEY, COL_FEATURE_ID, COL_GEOMETRY, COL_PIXELS, PartialRow
-from rzzs.zarr_backend import ZarrBackend, open_zarr_array
 
 
 def process_chunk(

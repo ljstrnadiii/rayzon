@@ -1,4 +1,4 @@
-from rzzs.grid import (
+from rayzon.grid import (
     GridSpec,
     chunk_id_to_slices,
     chunk_pixel_bounds_xy,

@@ -6,10 +6,9 @@ from dataclasses import dataclass
 from itertools import product
 
 import pyarrow as pa
-
-from rzzs.arrow import as_table, coerce_geometry
-from rzzs.grid import GridSpec, reconstruct_grid_spec, world_bbox_to_chunk_ranges
-from rzzs.types import COL_CHUNK_KEY, COL_FEATURE_ID, COL_GEOMETRY, ChunkJob
+from rayzon.arrow import as_table, coerce_geometry
+from rayzon.grid import GridSpec, reconstruct_grid_spec, world_bbox_to_chunk_ranges
+from rayzon.types import COL_CHUNK_KEY, COL_FEATURE_ID, COL_GEOMETRY, ChunkJob
 
 
 @dataclass(frozen=True)

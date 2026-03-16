@@ -8,14 +8,13 @@ import pyarrow as pa
 import pyproj
 import ray.data
 from affine import Affine
-
-from rzzs.arrow import geodataframe_to_geoarrow_table
-from rzzs.chunk_processor import process_chunk_group
-from rzzs.index import map_feature_to_chunk_rows
-from rzzs.rasterize_backend import RasterizeBackend
-from rzzs.stats import DEFAULT_STAT_EXPRS, build_aggregations, resolve_stat_exprs
-from rzzs.types import COL_CHUNK_KEY, COL_FEATURE_ID, COL_GEOMETRY
-from rzzs.zarr_backend import ZarrBackend, build_grid_spec, resolve_dim_coords
+from rayzon.arrow import geodataframe_to_geoarrow_table
+from rayzon.chunk_processor import process_chunk_group
+from rayzon.index import map_feature_to_chunk_rows
+from rayzon.rasterize_backend import RasterizeBackend
+from rayzon.stats import DEFAULT_STAT_EXPRS, build_aggregations, resolve_stat_exprs
+from rayzon.types import COL_CHUNK_KEY, COL_FEATURE_ID, COL_GEOMETRY
+from rayzon.zarr_backend import ZarrBackend, build_grid_spec, resolve_dim_coords
 
 if TYPE_CHECKING:
     import geopandas as gpd
@@ -35,8 +34,8 @@ def to_feature_dataset(
         raise ImportError(
             "GeoDataFrame support requires geopandas. "
             "Install with the 'geopandas' extra, for example "
-            '`pip install "rzzs[geopandas]"` or '
-            '`uv pip install "rzzs[geopandas]"`.'
+            '`pip install "rayzon[geopandas]"` or '
+            '`uv pip install "rayzon[geopandas]"`.'
         ) from exc
 
     if isinstance(feature_source, geopandas.GeoDataFrame):

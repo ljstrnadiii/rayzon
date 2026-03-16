@@ -2,10 +2,9 @@ from pathlib import Path
 
 import numpy as np
 import zarr
+from rayzon.chunk_processor import process_chunk
+from rayzon.zarr_backend import build_grid_spec, open_zarr_array
 from shapely.geometry import box
-
-from rzzs.chunk_processor import process_chunk
-from rzzs.zarr_backend import build_grid_spec, open_zarr_array
 
 
 def test_process_chunk_emits_partial_rows_for_2d_chunk(tmp_path: Path) -> None:
