@@ -13,6 +13,7 @@ authors = [{ name = "rzzs contributors" }]
 dependencies = [
   "affine>=2.4.0",
   "numpy>=1.26.0",
+  "obstore>=0.6",
   "pandas>=2.2.0",
   "pyarrow>=16.0.0",
   "pyproj>=3.6.0",

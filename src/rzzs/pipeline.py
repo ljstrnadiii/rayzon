@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -15,11 +16,22 @@ from rzzs.index import (
     _map_feature_batch_to_chunk_rows,
     build_chunk_to_features_from_grouped_rows,
     build_feature_chunk_index_from_chunk_to_features,
+    plan_chunk_jobs,
 )
+from rzzs.rasterize_backend import RasterizeBackend
 from rzzs.stats import DEFAULT_STAT_EXPRS, resolve_stat_exprs
+from rzzs.types import ChunkJob
+from rzzs.zarr_backend import ZarrBackend, build_grid_spec_from_mosaic
 
 if TYPE_CHECKING:
     import geopandas as gpd
+
+
+@dataclass(frozen=True)
+class PipelinePlan:
+    grid_spec: GridSpec
+    feature_index: ChunkFeatureIndex
+    chunk_jobs: list[ChunkJob]
 
 
 def geodataframe_to_geoarrow_table(frame: gpd.GeoDataFrame) -> pa.Table:
@@ -31,7 +43,7 @@ def to_feature_dataset(
 ) -> ray.data.Dataset:
     if isinstance(feature_source, ray.data.Dataset):
         return feature_source
-    if isinstance(feature_source, (str, Path)):
+    if isinstance(feature_source, str | Path):
         return ray.data.read_parquet(str(feature_source))
 
     try:
@@ -73,48 +85,97 @@ def build_feature_chunk_index(
     return build_feature_chunk_index_from_chunk_to_features(chunk_to_features)
 
 
+def build_pipeline_plan(
+    mosaic: str,
+    features: gpd.GeoDataFrame | str | Path | ray.data.Dataset,
+    *,
+    config: ZonalStatsConfig,
+    zarr_backend: ZarrBackend = ZarrBackend.ZARR_PYTHON,
+) -> PipelinePlan:
+    grid_spec = build_grid_spec_from_mosaic(
+        mosaic,
+        x_dim=config.x_dim,
+        y_dim=config.y_dim,
+        dst_crs=config.dst_crs,
+        zarr_backend=zarr_backend,
+    )
+    feature_dataset = to_feature_dataset(features)
+    feature_index = build_feature_chunk_index(feature_dataset, grid_spec)
+    chunk_jobs = plan_chunk_jobs(feature_index)
+
+    return PipelinePlan(
+        grid_spec=grid_spec,
+        feature_index=feature_index,
+        chunk_jobs=chunk_jobs,
+    )
+
+
 def run_zonal_stats(
     mosaic: str,
-    features: gpd.GeoDataFrame | str,
+    features: gpd.GeoDataFrame | str | Path | ray.data.Dataset,
     *,
     reduce_dims: Sequence[str],
     stats: Sequence[str] = DEFAULT_STAT_EXPRS,
     config: ZonalStatsConfig,
     output_uri: str,
+    zarr_backend: ZarrBackend = ZarrBackend.ZARR_PYTHON,
+    rasterize_backend: RasterizeBackend = RasterizeBackend.RASTERIO,
 ) -> str:
     """Run zonal statistics for a mosaic over vector features.
 
     Parameters
     ----------
-    mosaic
+    mosaic : str
         Store URI for the mosaic group. Default backend assumes a zarr group
         opened from an obstore-compatible store.
-    features
+    features : geopandas.GeoDataFrame | str | pathlib.Path | ray.data.Dataset
         Feature source as a GeoDataFrame or a parquet path readable by Ray.
-    reduce_dims
+    reduce_dims : collections.abc.Sequence[str]
         Dimensions to reduce across.
-    stats
+    stats : collections.abc.Sequence[str]
         Optional stat expressions. When omitted, defaults to
         ('count', 'n_valid', 'mean', 'std').
-    config
+    config : rzzs.config.ZonalStatsConfig
         Pipeline configuration.
-    output_uri
+    output_uri : str
         Output parquet sink URI.
+    zarr_backend : rzzs.zarr_backend.ZarrBackend
+        Zarr backend identifier. Defaults to zarr-python.
+    rasterize_backend : rzzs.rasterize_backend.RasterizeBackend
+        Rasterization backend identifier. Defaults to rasterio.
     """
 
-    requested_stats = tuple(stats)
-    _resolved = resolve_stat_exprs(list(requested_stats))
-    _ = mosaic, features, reduce_dims, _resolved, config, output_uri
-    raise NotImplementedError("run_zonal_stats will be implemented in orchestration phase")
+    resolved_stats = resolve_stat_exprs(list(stats))
+
+    plan = build_pipeline_plan(
+        mosaic,
+        features,
+        config=config,
+        zarr_backend=zarr_backend,
+    )
+    _ = plan, reduce_dims, resolved_stats, output_uri, rasterize_backend
+    raise NotImplementedError(
+        "Planning is implemented; chunk execution and final reduce/write are not implemented yet."
+    )
 
 
 def run_benchmark(
     mosaic: str,
-    features: gpd.GeoDataFrame | str,
+    features: gpd.GeoDataFrame | str | Path | ray.data.Dataset,
     *,
     benchmark_config: BenchmarkConfig,
 ) -> dict[str, float | int]:
-    """Run the benchmark harness for the configured workload."""
+    """Run the benchmark harness for the configured workload.
+
+    Parameters
+    ----------
+    mosaic : str
+        Store URI for the mosaic group.
+    features : geopandas.GeoDataFrame | str | pathlib.Path | ray.data.Dataset
+        Feature source as a GeoDataFrame or a parquet path readable by Ray.
+    benchmark_config : rzzs.config.BenchmarkConfig
+        Benchmark execution configuration.
+    """
 
     _ = mosaic, features, benchmark_config
     raise NotImplementedError("run_benchmark will be implemented in benchmark phase")

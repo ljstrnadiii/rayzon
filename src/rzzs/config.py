@@ -1,25 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
 
 
 @dataclass(frozen=True)
 class ZonalStatsConfig:
     x_dim: str
     y_dim: str
-    reduce_dims: tuple[str, ...]
     all_touched: bool = False
     nodata: float | int | None = None
     dst_crs: str | None = None
-    enable_quantiles: bool = False
     quantiles: tuple[float, ...] = ()
     quantile_compression: int = 200
     exact_quantile_pixel_threshold: int = 100_000
-    ray_use_dataset: bool = False
-    output_geometry: bool = True
-    output_format: Literal["geoparquet", "parquet"] = "geoparquet"
-    output_uri: str | None = None
 
     def __post_init__(self) -> None:
         if not self.x_dim or not self.y_dim:

@@ -177,7 +177,7 @@ def _chunk_key_to_chunk_id(chunk_key: str) -> ChunkId:
 
 
 def _normalize_feature_id(value: object) -> FeatureId:
-    if isinstance(value, (int, str)):
+    if isinstance(value, int | str):
         return value
     raise TypeError("feature_id values must be int or str")
 
@@ -190,7 +190,7 @@ def _bbox_to_tuple(value: object) -> tuple[float, float, float, float]:
             float(value["xmax"]),
             float(value["ymax"]),
         )
-    if isinstance(value, (list, tuple)) and len(value) == 4:
+    if isinstance(value, list | tuple) and len(value) == 4:
         xmin, ymin, xmax, ymax = value
         return (float(xmin), float(ymin), float(xmax), float(ymax))
     raise TypeError("bbox values must be dict-like with xmin/ymin/xmax/ymax")
@@ -199,8 +199,6 @@ def _bbox_to_tuple(value: object) -> tuple[float, float, float, float]:
 def _normalize_geometry_value(value: object) -> BaseGeometry:
     if isinstance(value, BaseGeometry):
         return value
-    if isinstance(value, (bytes, bytearray, memoryview)):
+    if isinstance(value, bytes | bytearray | memoryview):
         return from_wkb(bytes(value))
     raise TypeError("geometry values must be shapely geometry or WKB bytes")
-
-

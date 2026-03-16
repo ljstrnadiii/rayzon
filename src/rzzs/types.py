@@ -4,6 +4,7 @@ from typing import TypeAlias, TypedDict
 
 import numpy as np
 from affine import Affine
+from numpy.typing import NDArray
 from shapely.geometry.base import BaseGeometry
 
 ScalarValue: TypeAlias = int | float | str
@@ -11,7 +12,7 @@ FeatureId: TypeAlias = int | str
 ChunkId: TypeAlias = tuple[int, ...]
 DimValues: TypeAlias = tuple[ScalarValue, ...]
 AffineTuple: TypeAlias = tuple[float, float, float, float, float, float]
-AffineLike: TypeAlias = Affine | AffineTuple
+AffineLike: TypeAlias = Affine | AffineTuple | list[float] | NDArray[np.floating]
 GeometryStore: TypeAlias = dict[FeatureId, BaseGeometry]
 
 
