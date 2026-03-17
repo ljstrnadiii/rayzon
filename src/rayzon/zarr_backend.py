@@ -10,8 +10,9 @@ from urllib.parse import urlparse
 import numpy as np
 import zarr
 from obstore.store import LocalStore, S3Store
-from rayzon.grid import GridSpec
 from zarr.storage import ObjectStore
+
+from rayzon.grid import GridSpec
 
 
 class ZarrBackend(StrEnum):

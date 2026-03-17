@@ -8,6 +8,7 @@ import pyarrow as pa
 import pyproj
 import ray.data
 from affine import Affine
+
 from rayzon.arrow import geodataframe_to_geoarrow_table
 from rayzon.chunk_processor import process_chunk_group
 from rayzon.index import map_feature_to_chunk_rows
@@ -65,14 +66,12 @@ def zonal_stats(
     Parameters
     ----------
     store_uri : str
-        URI of the zarr store.  For a standalone zarr array, point directly
-        at the array.  For a zarr group (e.g. written by xarray), point at
-        the group root and set *array_name*.
+        URI of the zarr store.  For a standalone zarr array, point directly at the array.  For a
+        zarr group (e.g. written by xarray), point at the group root and set *array_name*.
     features : GeoDataFrame | str | Path | ray.data.Dataset
-        Geometries to compute statistics for. Must be in the same CRS as
-        *crs*.
+        Geometries to compute statistics for. Must be in the same CRS as *crs*.
     transform : Affine
-        Affine transform mapping pixel coordinates to the CRS.
+        The Affine transform of the raster data.
     crs : pyproj.CRS
         Coordinate reference system of the raster data.
     x_dim, y_dim : str
@@ -80,19 +79,20 @@ def zonal_stats(
     stats : Sequence[str]
         Stat expressions to compute, e.g. ``("count", "mean", "std")``.
     array_name : str | None
-        Name of the array within a zarr group.  ``None`` when *store_uri*
-        already points at a standalone array.
+        Name of the array within a zarr group.  ``None`` when *store_uri* already points at a
+        standalone array.
     all_touched : bool
         If True, all pixels touched by a geometry are included.
     nodata : float | int | None
         Pixel value to treat as missing (replaced with NaN before stats).
     decode_coords : bool
-        If True, use xarray to decode coordinate values for non-spatial
-        dimensions.  Requires the ``xarray`` extra.
+        If True, use xarray to decode coordinate values for non-spatial dimensions.  Requires the
+        ``xarray`` extra. Otherwise, values in the final dataset will be the corresponding integer
+        indices along each non-spatial dimension.
     zarr_backend : ZarrBackend
-        Backend for reading zarr data.
+        Backend for reading zarr data. Defaults to ZARR_PYTHON.
     rasterize_backend : RasterizeBackend
-        Backend for rasterizing geometries.
+        Backend for rasterizing geometries. Defaults to RASTERIO.
 
     Returns
     -------

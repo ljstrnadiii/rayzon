@@ -11,6 +11,7 @@ from ray.data.aggregate import (
     BlockAccessor,
 )
 from ray.data.block import Block
+
 from rayzon.types import COL_PIXELS
 
 DEFAULT_STAT_EXPRS: tuple[str, ...] = ("count", "n_valid", "mean", "std")
