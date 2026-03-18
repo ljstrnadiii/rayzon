@@ -1,10 +1,15 @@
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import zarr
+from shapely.geometry import box
+
 from rayzon.chunk_processor import process_chunk
 from rayzon.zarr_backend import build_grid_spec, open_zarr_array
-from shapely.geometry import box
+
+COL_SUM = "_partial_sum"
+COL_N_VALID = "_partial_n_valid"
 
 
 def test_process_chunk_emits_partial_rows_for_2d_chunk(tmp_path: Path) -> None:
@@ -42,8 +47,9 @@ def test_process_chunk_emits_partial_rows_for_2d_chunk(tmp_path: Path) -> None:
     row = rows[0]
     assert row["feature_id"] == "f1"
     assert row["dim_values"] == ()
-    assert isinstance(row["pixels"], np.ndarray)
-    assert len(row["pixels"]) > 0
+    assert cast(int, row["_partial_count"]) > 0
+    assert cast(int, row["_partial_n_valid"]) > 0
+    assert "_partial_digest" in row
 
 
 def test_process_chunk_emits_one_row_per_non_spatial_index(tmp_path: Path) -> None:
@@ -78,5 +84,47 @@ def test_process_chunk_emits_one_row_per_non_spatial_index(tmp_path: Path) -> No
     )
 
     assert len(rows) == 2
-    dim_values = sorted(row["dim_values"] for row in rows)
+    dim_values = sorted(cast(tuple[int, ...], row["dim_values"]) for row in rows)
     assert dim_values == [(0,), (1,)]
+
+
+def test_process_chunk_mean_only_skips_other_partial_columns(tmp_path: Path) -> None:
+    mosaic_path = tmp_path / "mosaic_mean_only.zarr"
+    array = zarr.open_array(
+        str(mosaic_path),
+        mode="w",
+        zarr_format=3,
+        shape=(4, 4),
+        chunks=(4, 4),
+        dtype=np.float32,
+        dimension_names=("y", "x"),
+    )
+    array[:] = np.arange(16, dtype=np.float32).reshape(4, 4)
+    array.attrs["transform"] = [1.0, 0.0, 0.0, 0.0, -1.0, 4.0]
+    array.attrs["crs"] = "EPSG:4326"
+
+    grid, *_ = build_grid_spec(
+        str(mosaic_path),
+        x_dim="x",
+        y_dim="y",
+        transform=(1.0, 0.0, 0.0, 0.0, -1.0, 4.0),
+        crs="EPSG:4326",
+    )
+    arr = open_zarr_array(str(mosaic_path))
+    rows = process_chunk(
+        chunk_id=(0, 0),
+        feature_ids=["f1"],
+        array=arr,
+        geometry_store={"f1": box(1.0, 1.0, 3.0, 3.0)},
+        grid_spec=grid,
+        partial_columns=(COL_SUM, COL_N_VALID),
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert set(row.keys()) == {
+        "feature_id",
+        "dim_values",
+        COL_SUM,
+        COL_N_VALID,
+    }

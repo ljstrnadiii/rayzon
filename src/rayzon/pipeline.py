@@ -13,7 +13,12 @@ from rayzon.arrow import geodataframe_to_geoarrow_table
 from rayzon.chunk_processor import process_chunk_group
 from rayzon.index import map_feature_to_chunk_rows
 from rayzon.rasterize_backend import RasterizeBackend
-from rayzon.stats import DEFAULT_STAT_EXPRS, build_aggregations, resolve_stat_exprs
+from rayzon.stats import (
+    DEFAULT_STAT_EXPRS,
+    build_aggregations,
+    required_partial_columns,
+    resolve_stat_exprs,
+)
 from rayzon.types import COL_CHUNK_KEY, COL_FEATURE_ID, COL_GEOMETRY
 from rayzon.zarr_backend import ZarrBackend, build_grid_spec, resolve_dim_coords
 
@@ -101,10 +106,11 @@ def zonal_stats(
         stat columns.
     """
     resolved = resolve_stat_exprs(list(stats))
+    partial_columns = required_partial_columns(resolved)
     transform_tuple = (transform.a, transform.b, transform.c, transform.d, transform.e, transform.f)
     crs_wkt = crs.to_wkt()
 
-    grid_spec, pixel_dtype, scale_factor, add_offset = build_grid_spec(
+    grid_spec, _, scale_factor, add_offset = build_grid_spec(
         store_uri,
         x_dim=x_dim,
         y_dim=y_dim,
@@ -145,7 +151,7 @@ def zonal_stats(
         "nodata": nodata,
         "zarr_backend_value": zarr_backend.value,
         "rasterize_backend_value": rasterize_backend.value,
-        "pixel_numpy_dtype": str(pixel_dtype),
+        "partial_columns": list(partial_columns),
         "feature_id_pa_type": str(feature_id_pa_type),
         "scale_factor": scale_factor,
         "add_offset": add_offset,

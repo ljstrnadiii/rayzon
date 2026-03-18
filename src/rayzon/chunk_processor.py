@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import cast
 
 import numpy as np
 import pyarrow as pa
@@ -13,7 +14,17 @@ from rayzon.arrow import as_table
 from rayzon.grid import GridSpec, chunk_id_to_slices, chunk_world_bounds, reconstruct_grid_spec
 from rayzon.index import _chunk_key_to_chunk_id, _normalize_feature_id
 from rayzon.rasterize_backend import RasterizeBackend, rasterize_geometry_window
-from rayzon.types import COL_CHUNK_KEY, COL_FEATURE_ID, COL_GEOMETRY, COL_PIXELS, PartialRow
+from rayzon.stats import (
+    ALL_PARTIAL_COLUMNS,
+    accumulate_partial_state,
+    partial_column_arrow_type,
+    partial_fields_for_columns,
+)
+from rayzon.types import (
+    COL_CHUNK_KEY,
+    COL_FEATURE_ID,
+    COL_GEOMETRY,
+)
 from rayzon.zarr_backend import ZarrBackend, open_zarr_array
 
 
@@ -28,15 +39,17 @@ def process_chunk(
     nodata: float | int | None = None,
     scale_factor: float | None = None,
     add_offset: float | None = None,
+    partial_columns: tuple[str, ...] = ALL_PARTIAL_COLUMNS,
     rasterize_backend: RasterizeBackend = RasterizeBackend.RASTERIO,
-) -> list[PartialRow]:
+) -> list[dict[str, object]]:
+    partial_fields = partial_fields_for_columns(partial_columns)
     chunk_slices = chunk_id_to_slices(chunk_id, grid_spec)
     chunk_data = np.asarray(array[chunk_slices])
 
     x0, y0, x1, y1 = _chunk_xy_bounds(chunk_id, grid_spec)
     chunk_bounds = chunk_world_bounds(chunk_id, grid_spec)
 
-    rows: list[PartialRow] = []
+    rows: list[dict[str, object]] = []
     for feature_id in feature_ids:
         geometry = geometry_store.get(feature_id)
         if geometry is None:
@@ -83,13 +96,16 @@ def process_chunk(
             ):
                 selected = selected * (scale_factor or 1.0) + (add_offset or 0.0)
 
-            rows.append(
-                {
-                    "feature_id": feature_id,
-                    "dim_values": dim_values,
-                    "pixels": selected,
-                }
-            )
+            partial_state = accumulate_partial_state(selected, required_fields=partial_fields)
+            if partial_state is None:
+                continue
+            row: dict[str, object] = {
+                "feature_id": feature_id,
+                "dim_values": dim_values,
+            }
+            for column in partial_columns:
+                row[column] = partial_state[column]
+            rows.append(row)
 
     return rows
 
@@ -186,7 +202,7 @@ def process_chunk_group(
     nodata: float | int | None,
     zarr_backend_value: str,
     rasterize_backend_value: str,
-    pixel_numpy_dtype: str,
+    partial_columns: list[str],
     feature_id_pa_type: str,
     scale_factor: float | None,
     add_offset: float | None,
@@ -199,6 +215,7 @@ def process_chunk_group(
     x_dim: str,
     y_dim: str,
 ) -> pa.Table:
+    partial_columns_tuple = tuple(partial_columns)
     grid_spec = reconstruct_grid_spec(
         dims=dims,
         shape=shape,
@@ -211,12 +228,15 @@ def process_chunk_group(
     zarr_backend = ZarrBackend(zarr_backend_value)
     rasterize_backend = RasterizeBackend(rasterize_backend_value)
     non_spatial_dims = [d for d in grid_spec.dims if d not in (y_dim, x_dim)]
-    pixel_pa_type = pa.from_numpy_dtype(np.dtype(pixel_numpy_dtype))
     fid_pa_type = _resolve_fid_type(feature_id_pa_type)
 
     table = as_table(batch)
     if table.num_rows == 0:
-        return _empty_batch(non_spatial_dims, pixel_pa_type=pixel_pa_type, fid_pa_type=fid_pa_type)
+        return _empty_batch(
+            non_spatial_dims,
+            fid_pa_type=fid_pa_type,
+            partial_columns=partial_columns_tuple,
+        )
 
     chunk_key = table.column(COL_CHUNK_KEY)[0].as_py()
     chunk_id = _chunk_key_to_chunk_id(chunk_key)
@@ -245,13 +265,14 @@ def process_chunk_group(
         nodata=nodata,
         scale_factor=scale_factor,
         add_offset=add_offset,
+        partial_columns=partial_columns_tuple,
         rasterize_backend=rasterize_backend,
     )
     return _rows_to_batch(
         rows,
         non_spatial_dims,
-        pixel_pa_type=pixel_pa_type,
         fid_pa_type=fid_pa_type,
+        partial_columns=partial_columns_tuple,
         dim_coord_values=dim_coord_values,
     )
 
@@ -266,14 +287,13 @@ def _resolve_fid_type(type_str: str) -> pa.DataType:
 def _empty_batch(
     non_spatial_dims: list[str],
     *,
-    pixel_pa_type: pa.DataType,
     fid_pa_type: pa.DataType,
+    partial_columns: tuple[str, ...],
     dim_coord_values: dict[str, list] | None = None,
 ) -> pa.Table:
-    columns: dict[str, pa.Array] = {
-        COL_FEATURE_ID: pa.array([], type=fid_pa_type),
-        COL_PIXELS: pa.array([], type=pa.list_(pixel_pa_type)),
-    }
+    columns: dict[str, pa.Array] = {COL_FEATURE_ID: pa.array([], type=fid_pa_type)}
+    for column in partial_columns:
+        columns[column] = pa.array([], type=partial_column_arrow_type(column))
     for dim in non_spatial_dims:
         if dim_coord_values and dim in dim_coord_values and dim_coord_values[dim]:
             sample = dim_coord_values[dim][0]
@@ -284,30 +304,30 @@ def _empty_batch(
 
 
 def _rows_to_batch(
-    rows: list[PartialRow],
+    rows: list[dict[str, object]],
     non_spatial_dims: list[str],
     *,
-    pixel_pa_type: pa.DataType,
     fid_pa_type: pa.DataType,
+    partial_columns: tuple[str, ...],
     dim_coord_values: dict[str, list] | None = None,
 ) -> pa.Table:
     if not rows:
         return _empty_batch(
             non_spatial_dims,
-            pixel_pa_type=pixel_pa_type,
             fid_pa_type=fid_pa_type,
+            partial_columns=partial_columns,
             dim_coord_values=dim_coord_values,
         )
-    pixel_arrays = [pa.array(r["pixels"], type=pixel_pa_type) for r in rows]
     columns: dict[str, pa.Array] = {
-        COL_FEATURE_ID: pa.array([r["feature_id"] for r in rows], type=fid_pa_type),
-        COL_PIXELS: pa.ListArray.from_arrays(
-            pa.array(np.cumsum([0] + [len(a) for a in pixel_arrays]), type=pa.int32()),
-            pa.concat_arrays(pixel_arrays),
-        ),
+        COL_FEATURE_ID: pa.array([r["feature_id"] for r in rows], type=fid_pa_type)
     }
+    for column in partial_columns:
+        columns[column] = pa.array(
+            [r.get(column) for r in rows],
+            type=partial_column_arrow_type(column),
+        )
     for dim_idx, dim in enumerate(non_spatial_dims):
-        raw_indices = [r.get("dim_values", ())[dim_idx] for r in rows]
+        raw_indices = [cast(tuple[int, ...], r["dim_values"])[dim_idx] for r in rows]
         if dim_coord_values and dim in dim_coord_values:
             coord_list = dim_coord_values[dim]
             columns[dim] = pa.array([coord_list[int(i)] for i in raw_indices])

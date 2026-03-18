@@ -6,13 +6,14 @@ import pandas as pd
 import pyproj
 import zarr
 from affine import Affine
+from shapely.geometry import Point, box
+
 from rayzon.arrow import as_table, geodataframe_to_geoarrow_table
 from rayzon.pipeline import (
     to_feature_dataset,
     zonal_stats,
 )
 from rayzon.types import COL_FEATURE_ID
-from shapely.geometry import Point, box
 
 
 def _gdf() -> gpd.GeoDataFrame:
@@ -253,3 +254,56 @@ def test_zonal_stats_decode_coords(tmp_path: Path) -> None:
     time_vals = sorted(out["time"].unique())
     assert pd.Timestamp(time_vals[0]) == pd.Timestamp("2020-01-01")
     assert pd.Timestamp(time_vals[-1]) == pd.Timestamp("2020-01-03")
+
+
+def test_zonal_stats_quantiles_tdigest_approximation(tmp_path: Path) -> None:
+    mosaic_path = tmp_path / "mosaic_quantiles.zarr"
+    values = np.concatenate(
+        [
+            np.linspace(0.0, 10.0, 900, dtype=np.float32),
+            np.linspace(100.0, 1000.0, 100, dtype=np.float32),
+        ]
+    )
+    array = zarr.open_array(
+        str(mosaic_path),
+        mode="w",
+        zarr_format=3,
+        shape=(40, 25),
+        chunks=(20, 25),
+        dtype=np.float32,
+        dimension_names=("y", "x"),
+    )
+    array[:] = values.reshape(40, 25)
+    array.attrs["transform"] = [1.0, 0.0, 0.0, 0.0, -1.0, 40.0]
+    array.attrs["crs"] = "EPSG:4326"
+
+    features = gpd.GeoDataFrame(
+        {COL_FEATURE_ID: ["a"], "geometry": [box(0.0, 0.0, 25.0, 40.0)]},
+        geometry="geometry",
+    )
+
+    result_ds = zonal_stats(
+        str(mosaic_path),
+        features,
+        transform=Affine(1.0, 0.0, 0.0, 0.0, -1.0, 40.0),
+        crs=pyproj.CRS("EPSG:4326"),
+        stats=("p50", "p95"),
+    )
+
+    output_path = tmp_path / "stats_quantiles.parquet"
+    result_ds.write_parquet(str(output_path))
+    out = pd.read_parquet(output_path)
+    assert len(out) == 1
+    assert {"p50", "p95"} <= set(out.columns)
+
+    expected_p50 = float(np.quantile(values.astype(np.float64), 0.5))
+    expected_p95 = float(np.quantile(values.astype(np.float64), 0.95))
+    actual_p50 = float(out.iloc[0]["p50"])
+    actual_p95 = float(out.iloc[0]["p95"])
+
+    # Explicit relative tolerances to keep approximation expectations readable.
+    p50_rtol = 0.0001
+    p95_rtol = 0.01
+
+    np.testing.assert_allclose(actual_p50, expected_p50, rtol=p50_rtol, atol=0.0)
+    np.testing.assert_allclose(actual_p95, expected_p95, rtol=p95_rtol, atol=0.0)
