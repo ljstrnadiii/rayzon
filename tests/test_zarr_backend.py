@@ -7,8 +7,9 @@ import numpy as np
 import pytest
 import xarray as xr
 import zarr
-from rayzon.zarr_backend import ZarrBackend, build_grid_spec, get_obstore
 from zarr.storage import ObjectStore
+
+from rayzon.zarr_backend import ZarrBackend, build_grid_spec, get_obstore
 
 
 def test_build_grid_spec_standalone_array(tmp_path: Path) -> None:
@@ -71,6 +72,14 @@ def test_get_obstore_local(tmp_path: Path) -> None:
 
 def test_get_obstore_s3_uri() -> None:
     store = get_obstore("s3://example-bucket/path/to/mosaic.zarr", region="us-west-2")
+    assert isinstance(store, ObjectStore)
+
+
+def test_get_obstore_s3_uri_accepts_anon_storage_option() -> None:
+    store = get_obstore(
+        "s3://example-bucket/path/to/mosaic.zarr",
+        storage_options={"anon": True, "region": "us-west-2"},
+    )
     assert isinstance(store, ObjectStore)
 
 

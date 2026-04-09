@@ -417,6 +417,15 @@ def partial_column_arrow_type(column: str) -> pa.DataType:
     return field.arrow_type
 
 
+def stat_output_arrow_type(expr: str) -> pa.DataType:
+    stat = _stat_for_name(normalize_stat_expr(expr))
+    if stat is None or stat.stat_name is None:
+        raise ValueError(f"Unsupported stat expression '{expr}'")
+    if stat.stat_name in {"count", "n_valid"}:
+        return pa.int64()
+    return pa.float64()
+
+
 def accumulate_partial_state(
     values: np.ndarray,
     *,

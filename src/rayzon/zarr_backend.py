@@ -20,12 +20,24 @@ class ZarrBackend(StrEnum):
 
 
 class ZarrArrayOpener(Protocol):
-    def __call__(self, store_uri: str, *, array_name: str | None) -> zarr.Array: ...
+    def __call__(
+        self,
+        store_uri: str,
+        *,
+        array_name: str | None,
+        storage_options: Mapping[str, Any] | None = None,
+    ) -> zarr.Array: ...
 
 
 class _ZarrPythonOpener:
-    def __call__(self, store_uri: str, *, array_name: str | None) -> zarr.Array:
-        store = get_obstore(store_uri)
+    def __call__(
+        self,
+        store_uri: str,
+        *,
+        array_name: str | None,
+        storage_options: Mapping[str, Any] | None = None,
+    ) -> zarr.Array:
+        store = get_obstore(store_uri, storage_options=storage_options)
         if array_name is not None:
             group = zarr.open_group(store=store, mode="r")
             arr = group[array_name]
@@ -45,24 +57,39 @@ def build_grid_spec(
     *,
     x_dim: str,
     y_dim: str,
-    transform: tuple[float, float, float, float, float, float],
-    crs: str,
+    transform: tuple[float, float, float, float, float, float] | None,
+    crs: str | None,
     array_name: str | None = None,
     zarr_backend: ZarrBackend = ZarrBackend.ZARR_PYTHON,
+    storage_options: Mapping[str, Any] | None = None,
 ) -> tuple[GridSpec, np.dtype, float | None, float | None]:
-    array = open_zarr_array(store_uri, array_name=array_name, zarr_backend=zarr_backend)
+    array = open_zarr_array(
+        store_uri,
+        array_name=array_name,
+        zarr_backend=zarr_backend,
+        storage_options=storage_options,
+    )
     shape = tuple(int(size) for size in array.shape)
-    chunk_sizes = _normalize_chunk_sizes(array.chunks, shape)
+    chunks = array.shards or array.chunks
+    chunk_sizes = _normalize_chunk_sizes(chunks, shape)
     attrs = dict(array.attrs)
     raw_dims = _resolve_raw_dims(array, attrs)
     dims = _resolve_dims(raw_dims, rank=len(shape), x_dim=x_dim, y_dim=y_dim)
+    resolved_transform, resolved_crs = resolve_geospatial_metadata(
+        store_uri,
+        array_name=array_name,
+        array_attrs=attrs,
+        transform=transform,
+        crs=crs,
+        storage_options=storage_options,
+    )
 
     grid = GridSpec(
         dims=dims,
         shape=shape,
         chunk_sizes=chunk_sizes,
-        transform=transform,
-        crs=crs,
+        transform=resolved_transform,
+        crs=resolved_crs,
         x_dim=x_dim,
         y_dim=y_dim,
     )
@@ -76,11 +103,21 @@ def open_zarr_array(
     *,
     array_name: str | None = None,
     zarr_backend: ZarrBackend = ZarrBackend.ZARR_PYTHON,
+    storage_options: Mapping[str, Any] | None = None,
 ) -> zarr.Array:
     opener = _ZARR_OPENERS.get(zarr_backend)
     if opener is None:
         raise ValueError(f"Unsupported zarr backend: {zarr_backend}")
-    return opener(store_uri, array_name=array_name)
+    return opener(store_uri, array_name=array_name, storage_options=storage_options)
+
+
+def open_zarr_group(
+    store_uri: str,
+    *,
+    storage_options: Mapping[str, Any] | None = None,
+) -> zarr.Group:
+    store = get_obstore(store_uri, storage_options=storage_options)
+    return zarr.open_group(store=store, mode="r")
 
 
 def _normalize_chunk_sizes(chunks: Sequence[int] | None, shape: tuple[int, ...]) -> tuple[int, ...]:
@@ -159,37 +196,63 @@ def resolve_dim_coords(
     x_dim: str,
     y_dim: str,
     array_name: str | None = None,
+    storage_options: Mapping[str, Any] | None = None,
 ) -> dict[str, list]:
-    try:
-        import xarray as xr
-    except ImportError as exc:
-        raise ImportError(
-            "decode_coords requires xarray. "
-            "Install with the 'xarray' extra, for example "
-            '`pip install "rayzon[xarray]"` or '
-            '`uv pip install "rayzon[xarray]"`.'
-        ) from exc
-
     non_spatial = [d for d in dims if d not in (x_dim, y_dim)]
     if not non_spatial:
         return {}
 
-    if array_name is not None:
-        ds = xr.open_dataset(store_uri, engine="zarr", chunks=None)
-        da = ds[array_name]
-    else:
-        da = xr.open_dataarray(store_uri, engine="zarr", chunks=None)
-
+    dim_sizes = _resolve_dim_sizes(
+        store_uri,
+        dims=dims,
+        array_name=array_name,
+        storage_options=storage_options,
+    )
     coords: dict[str, list] = {}
+    group = open_zarr_group(store_uri, storage_options=storage_options)
     for dim in non_spatial:
-        if dim in da.coords:
-            coords[dim] = da.coords[dim].values.tolist()
+        if dim in group and isinstance(group[dim], zarr.Array):
+            coords[dim] = _decode_coord_values(np.asarray(group[dim]), dict(group[dim].attrs))
         else:
-            coords[dim] = list(range(da.sizes.get(dim, 0)))
+            coords[dim] = list(range(dim_sizes.get(dim, 0)))
     return coords
 
 
-def get_obstore(mosaic_uri: str, *, region: str | None = None) -> ObjectStore:
+def _resolve_dim_sizes(
+    store_uri: str,
+    *,
+    dims: Sequence[str],
+    array_name: str | None,
+    storage_options: Mapping[str, Any] | None = None,
+) -> dict[str, int]:
+    array = open_zarr_array(
+        store_uri,
+        array_name=array_name,
+        storage_options=storage_options,
+    )
+    return {dim: int(size) for dim, size in zip(dims, array.shape, strict=True)}
+
+
+def _decode_coord_values(values: np.ndarray, attrs: Mapping[str, Any]) -> list:
+    units = attrs.get("units")
+    if isinstance(units, str) and "since" in units:
+        try:
+            from xarray.coding.times import decode_cf_datetime
+
+            calendar = attrs.get("calendar")
+            decoded = decode_cf_datetime(values, units, calendar=calendar)
+            return cast("list[Any]", decoded.tolist())
+        except Exception:
+            pass
+    return cast("list[Any]", values.tolist())
+
+
+def get_obstore(
+    mosaic_uri: str,
+    *,
+    region: str | None = None,
+    storage_options: Mapping[str, Any] | None = None,
+) -> ObjectStore:
     parsed = urlparse(mosaic_uri)
     scheme = parsed.scheme.lower()
 
@@ -201,19 +264,93 @@ def get_obstore(mosaic_uri: str, *, region: str | None = None) -> ObjectStore:
         if not parsed.netloc:
             raise ValueError(f"Invalid S3 URI: {mosaic_uri}")
 
+        options = _normalize_storage_options(storage_options)
         resolved_region = (
-            region
+            cast("str | None", options.pop("region", None))
+            or region
             or os.environ.get("AWS_REGION")
             or os.environ.get("AWS_DEFAULT_REGION")
             or "us-east-1"
         )
 
+        s3_config = dict(cast("Mapping[str, Any]", options.pop("config", {})))
+        s3_config.setdefault("region", resolved_region)
         return ObjectStore(
             S3Store(
                 bucket=parsed.netloc,
                 prefix=parsed.path.lstrip("/"),
-                config={"region": resolved_region},
+                config=cast("Any", s3_config),
+                **options,
             )
         )
 
     raise ValueError(f"Unsupported store URI scheme for mosaic: {mosaic_uri}")
+
+
+def resolve_geospatial_metadata(
+    store_uri: str,
+    *,
+    array_name: str | None,
+    array_attrs: Mapping[str, Any] | None = None,
+    transform: tuple[float, float, float, float, float, float] | None,
+    crs: str | None,
+    storage_options: Mapping[str, Any] | None = None,
+) -> tuple[tuple[float, float, float, float, float, float], str]:
+    group_attrs: Mapping[str, Any] = {}
+    if array_name is not None:
+        group_attrs = dict(open_zarr_group(store_uri, storage_options=storage_options).attrs)
+    attrs = dict(array_attrs or {})
+
+    resolved_transform = transform or _transform_from_attrs(attrs, group_attrs)
+    if resolved_transform is None:
+        raise ValueError(
+            "Could not determine raster transform. Pass transform=Affine(...) or set "
+            "'transform'/'spatial:transform' in the array or root group attrs."
+        )
+
+    resolved_crs = crs or _crs_from_attrs(attrs, group_attrs)
+    if resolved_crs is None:
+        raise ValueError(
+            "Could not determine raster CRS. Pass crs=pyproj.CRS(...) or set "
+            "'crs'/'proj:code'/'proj:wkt2' in the array or root group attrs."
+        )
+
+    return resolved_transform, resolved_crs
+
+
+def _transform_from_attrs(
+    array_attrs: Mapping[str, Any],
+    group_attrs: Mapping[str, Any],
+) -> tuple[float, float, float, float, float, float] | None:
+    for attrs in (array_attrs, group_attrs):
+        raw = attrs.get("transform") or attrs.get("spatial:transform")
+        if isinstance(raw, Sequence) and len(raw) == 6:
+            values = tuple(float(value) for value in raw)
+            return cast("tuple[float, float, float, float, float, float]", values)
+    return None
+
+
+def _crs_from_attrs(
+    array_attrs: Mapping[str, Any],
+    group_attrs: Mapping[str, Any],
+) -> str | None:
+    for attrs in (array_attrs, group_attrs):
+        for key in ("crs", "proj:code", "proj:wkt2"):
+            raw = attrs.get(key)
+            if raw is None:
+                continue
+            if key == "proj:code" and isinstance(raw, int):
+                return f"EPSG:{raw}"
+            return str(raw)
+    return None
+
+
+def _normalize_storage_options(
+    storage_options: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    options = dict(storage_options or {})
+    if "anon" in options and "skip_signature" not in options:
+        options["skip_signature"] = bool(options.pop("anon"))
+    else:
+        options.pop("anon", None)
+    return options

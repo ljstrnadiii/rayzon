@@ -3,6 +3,7 @@ from pathlib import Path
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyproj
 import zarr
 from affine import Affine
@@ -10,6 +11,7 @@ from shapely.geometry import Point, box
 
 from rayzon.arrow import as_table, geodataframe_to_geoarrow_table
 from rayzon.pipeline import (
+    _detect_feature_id_type,
     to_feature_dataset,
     zonal_stats,
 )
@@ -62,6 +64,58 @@ def test_to_feature_dataset_from_geoparquet_path(tmp_path: Path) -> None:
     field = table.schema.field("geometry")
     metadata = field.metadata or {}
     assert metadata.get(b"ARROW:extension:name") == b"geoarrow.wkb"
+
+
+def test_to_feature_dataset_applies_override_num_blocks_for_geoparquet_path(tmp_path: Path) -> None:
+    path = tmp_path / "features_blocks.parquet"
+    _gdf().to_parquet(path, index=False)
+
+    dataset = to_feature_dataset(path, override_num_blocks=2).materialize()
+
+    assert dataset.num_blocks() == 2
+
+
+def test_to_feature_dataset_applies_override_num_blocks_for_geodataframe() -> None:
+    dataset = to_feature_dataset(_gdf(), override_num_blocks=2).materialize()
+
+    assert dataset.num_blocks() == 2
+
+
+def test_to_feature_dataset_synthesizes_integer_feature_id_when_missing(tmp_path: Path) -> None:
+    path = tmp_path / "features_without_feature_id.parquet"
+    gdf = gpd.GeoDataFrame(
+        {
+            "value": [10, 20],
+            "geometry": [Point(0, 0), Point(1, 1)],
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    gdf.to_parquet(path, index=False)
+
+    dataset = to_feature_dataset(path)
+    rows = dataset.take_all()
+
+    assert len(rows) == 2
+    assert COL_FEATURE_ID in rows[0]
+    assert [row[COL_FEATURE_ID] for row in rows] == [0, 1]
+
+
+def test_detect_feature_id_type_uses_arrow_base_schema_for_generated_ids(tmp_path: Path) -> None:
+    path = tmp_path / "features_without_feature_id_for_type.parquet"
+    gdf = gpd.GeoDataFrame(
+        {
+            "value": [10, 20],
+            "geometry": [Point(0, 0), Point(1, 1)],
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    gdf.to_parquet(path, index=False)
+
+    dataset = to_feature_dataset(path)
+
+    assert _detect_feature_id_type(dataset) == pa.int64()
 
 
 def test_zonal_stats_smoke(tmp_path: Path) -> None:
@@ -254,6 +308,118 @@ def test_zonal_stats_decode_coords(tmp_path: Path) -> None:
     time_vals = sorted(out["time"].unique())
     assert pd.Timestamp(time_vals[0]) == pd.Timestamp("2020-01-01")
     assert pd.Timestamp(time_vals[-1]) == pd.Timestamp("2020-01-03")
+
+
+def test_zonal_stats_selectors_subset_time_dimension(tmp_path: Path) -> None:
+    import xarray as xr
+
+    mosaic_path = tmp_path / "mosaic_selector.zarr"
+    times = pd.to_datetime(["2022-12-31", "2023-01-01", "2023-06-01", "2024-01-01"])
+    ds = xr.Dataset(
+        {"data": (("time", "band", "y", "x"), np.ones((4, 1, 4, 4), dtype=np.float32))},
+        coords={
+            "time": times,
+            "band": ["b1"],
+            "y": np.arange(4.0, 0.0, -1.0),
+            "x": np.arange(0.0, 4.0),
+        },
+    )
+    ds["data"].attrs["transform"] = [1.0, 0.0, 0.0, 0.0, -1.0, 4.0]
+    ds["data"].attrs["crs"] = "EPSG:4326"
+    ds.to_zarr(str(mosaic_path), mode="w", zarr_format=3)
+
+    features = gpd.GeoDataFrame(
+        {COL_FEATURE_ID: ["a"], "geometry": [box(0, 0, 4, 4)]},
+        geometry="geometry",
+    )
+
+    result_ds = zonal_stats(
+        str(mosaic_path),
+        features,
+        transform=Affine(1.0, 0.0, 0.0, 0.0, -1.0, 4.0),
+        crs=pyproj.CRS("EPSG:4326"),
+        stats=("count", "mean"),
+        array_name="data",
+        decode_coords=True,
+        selectors={"time": "2023"},
+    )
+
+    output_path = tmp_path / "stats_selector.parquet"
+    result_ds.write_parquet(str(output_path))
+    out = pd.read_parquet(output_path).sort_values("time").reset_index(drop=True)
+
+    assert len(out) == 2
+    assert sorted(pd.Timestamp(value) for value in out["time"].unique()) == [
+        pd.Timestamp("2023-01-01"),
+        pd.Timestamp("2023-06-01"),
+    ]
+    assert out["count"].tolist() == [16, 16]
+
+
+def test_zonal_stats_infers_root_spatial_metadata_for_group_arrays(
+    tmp_path: Path,
+) -> None:
+    import xarray as xr
+
+    mosaic_path = tmp_path / "mosaic_vectors.zarr"
+    times = pd.date_range("2020-01-01", periods=2, freq="YS")
+    bands = ["b1", "b2", "b3"]
+    data = np.stack(
+        [
+            np.stack([np.full((4, 4), fill_value=t * 10 + b, dtype=np.float32) for b in range(3)])
+            for t in range(2)
+        ]
+    )
+    ds = xr.Dataset(
+        {"embeddings": (("time", "band", "y", "x"), data)},
+        coords={
+            "time": times,
+            "band": bands,
+            "y": np.arange(4.0, 0.0, -1.0),
+            "x": np.arange(0.0, 4.0),
+        },
+    )
+    ds.attrs["spatial:transform"] = [1.0, 0.0, 0.0, 0.0, -1.0, 4.0]
+    ds.attrs["proj:code"] = "EPSG:4326"
+    ds.to_zarr(str(mosaic_path), mode="w", zarr_format=3)
+
+    features = gpd.GeoDataFrame(
+        {COL_FEATURE_ID: ["a"], "geometry": [box(0, 0, 4, 4)]},
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+
+    result_ds = zonal_stats(
+        str(mosaic_path),
+        features,
+        stats=("mean",),
+        array_name="embeddings",
+        decode_coords=True,
+    )
+
+    output_path = tmp_path / "stats_group_attrs.parquet"
+    result_ds.write_parquet(str(output_path))
+    out = pd.read_parquet(output_path).sort_values("time").reset_index(drop=True)
+
+    assert len(out) == 6
+    assert set(out["band"]) == set(bands)
+    assert out.iloc[0][COL_FEATURE_ID] == "a"
+    assert set(pd.Timestamp(value) for value in out["time"].unique()) == {
+        pd.Timestamp("2020-01-01"),
+        pd.Timestamp("2021-01-01"),
+    }
+
+    expected = {
+        (pd.Timestamp("2020-01-01"), "b1"): 0.0,
+        (pd.Timestamp("2020-01-01"), "b2"): 1.0,
+        (pd.Timestamp("2020-01-01"), "b3"): 2.0,
+        (pd.Timestamp("2021-01-01"), "b1"): 10.0,
+        (pd.Timestamp("2021-01-01"), "b2"): 11.0,
+        (pd.Timestamp("2021-01-01"), "b3"): 12.0,
+    }
+    for _, row in out.iterrows():
+        key = (pd.Timestamp(row["time"]), row["band"])
+        assert row["mean"] == expected[key]
 
 
 def test_zonal_stats_quantiles_tdigest_approximation(tmp_path: Path) -> None:
