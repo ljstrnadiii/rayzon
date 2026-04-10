@@ -164,6 +164,60 @@ def test_zonal_stats_infers_root_spatial_metadata_for_group_arrays(
         assert row["mean"] == expected[key]
 
 
+def test_zonal_stats_vectorizes_band_dimension_in_source_order(tmp_path: Path) -> None:
+    import xarray as xr
+
+    mosaic_path = tmp_path / "mosaic_vectorized_band.zarr"
+    times = pd.date_range("2020-01-01", periods=2, freq="YS")
+    bands = ["b1", "b2", "b3"]
+    data = np.stack(
+        [
+            np.stack([np.full((4, 4), fill_value=t * 10 + b, dtype=np.float32) for b in range(3)])
+            for t in range(2)
+        ]
+    )
+    ds = xr.Dataset(
+        {"embeddings": (("time", "band", "y", "x"), data)},
+        coords={
+            "time": times,
+            "band": bands,
+            "y": np.arange(4.0, 0.0, -1.0),
+            "x": np.arange(0.0, 4.0),
+        },
+    )
+    ds.attrs["spatial:transform"] = [1.0, 0.0, 0.0, 0.0, -1.0, 4.0]
+    ds.attrs["proj:code"] = "EPSG:4326"
+    ds.to_zarr(str(mosaic_path), mode="w", zarr_format=3)
+
+    features = gpd.GeoDataFrame(
+        {COL_FEATURE_ID: ["a"], "geometry": [box(0, 0, 4, 4)]},
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+
+    result_ds = zonal_stats(
+        str(mosaic_path),
+        features,
+        stats=("mean",),
+        array_name="embeddings",
+        decode_coords=True,
+        vectorize_dim="band",
+    )
+
+    output_path = tmp_path / "stats_vectorized_band.parquet"
+    result_ds.write_parquet(str(output_path))
+    out = pd.read_parquet(output_path).sort_values("time").reset_index(drop=True)
+
+    assert len(out) == 2
+    assert set(out.columns) == {COL_FEATURE_ID, "time", "mean"}
+    assert out[COL_FEATURE_ID].tolist() == ["a", "a"]
+    assert [pd.Timestamp(value) for value in out["time"]] == list(times)
+    np.testing.assert_allclose(
+        np.stack(out["mean"].to_numpy()),
+        np.array([[0.0, 1.0, 2.0], [10.0, 11.0, 12.0]], dtype=np.float64),
+    )
+
+
 def test_zonal_stats_quantiles_tdigest_approximation(tmp_path: Path) -> None:
     mosaic_path = tmp_path / "mosaic_quantiles.zarr"
     values = np.concatenate(

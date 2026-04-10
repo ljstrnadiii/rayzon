@@ -47,6 +47,7 @@ class ZonalStatsPlan:
     requested_selectors: dict[str, object]
     dim_coord_values: dict[str, list]
     allowed_dim_indices: dict[str, list[int]]
+    selected_dim_values: dict[str, list[object]]
     allowed_chunk_ids_by_dim: dict[str, list[int]]
     feature_ds: ray.data.Dataset
     feature_id_pa_type: pa.DataType
@@ -128,6 +129,12 @@ def build_zonal_stats_plan(
         dim_coord_values=dim_coord_values,
         selectors=requested_selectors,
     )
+    selected_dim_values = _resolve_selected_dim_values(
+        non_spatial_dims=non_spatial_dims,
+        dim_coord_values=dim_coord_values,
+        allowed_dim_indices=allowed_dim_indices,
+        decode_coords=decode_coords,
+    )
     allowed_chunk_ids_by_dim = _resolve_allowed_chunk_ids_by_dim(
         grid_spec=grid_spec,
         allowed_dim_indices=allowed_dim_indices,
@@ -185,6 +192,7 @@ def build_zonal_stats_plan(
         requested_selectors=requested_selectors,
         dim_coord_values=dim_coord_values,
         allowed_dim_indices=allowed_dim_indices,
+        selected_dim_values=selected_dim_values,
         allowed_chunk_ids_by_dim=allowed_chunk_ids_by_dim,
         feature_ds=feature_ds,
         feature_id_pa_type=feature_id_pa_type,
@@ -292,6 +300,27 @@ def _resolve_allowed_chunk_ids_by_dim(
         chunk_size = grid_spec.chunk_sizes[axis]
         allowed_chunk_ids[dim] = sorted({int(index) // int(chunk_size) for index in indices})
     return allowed_chunk_ids
+
+
+def _resolve_selected_dim_values(
+    *,
+    non_spatial_dims: list[str],
+    dim_coord_values: Mapping[str, list],
+    allowed_dim_indices: Mapping[str, list[int]],
+    decode_coords: bool,
+) -> dict[str, list[object]]:
+    selected: dict[str, list[object]] = {}
+    for dim in non_spatial_dims:
+        indices = allowed_dim_indices[dim]
+        if not decode_coords:
+            selected[dim] = [int(index) for index in indices]
+            continue
+        coord_values = dim_coord_values.get(dim)
+        if coord_values is None:
+            selected[dim] = [int(index) for index in indices]
+            continue
+        selected[dim] = [coord_values[index] for index in indices]
+    return selected
 
 
 def _resolve_dim_selector_indices(

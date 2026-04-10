@@ -555,6 +555,8 @@ def _finalize_partial_rows_in_feature_group(
     group_keys: list[str],
     partial_columns: list[str],
     requested_stats: list[str],
+    vectorize_dim: str | None = None,
+    vector_dim_values: list[object] | None = None,
 ) -> pa.Table:
     combined = _combine_partial_rows_within_batch(
         batch,
@@ -586,6 +588,92 @@ def _finalize_partial_rows_in_feature_group(
         combined.num_rows,
         group_keys,
         requested_stats,
+    )
+    output = pa.table(columns)
+    if vectorize_dim is None:
+        return output
+    if vector_dim_values is None:
+        raise ValueError("vector_dim_values must be provided when vectorize_dim is set.")
+    vector_group_keys = [key for key in group_keys if key != vectorize_dim]
+    return _vectorize_stats_rows_in_group(
+        output,
+        group_keys=vector_group_keys,
+        vector_dim=vectorize_dim,
+        vector_dim_values=vector_dim_values,
+        value_columns=requested_stats,
+    )
+
+
+def _vectorize_stats_rows_in_group(
+    batch: pa.Table,
+    *,
+    group_keys: list[str],
+    vector_dim: str,
+    vector_dim_values: list[object],
+    value_columns: list[str],
+) -> pa.Table:
+    table = as_table(batch)
+    if table.num_rows == 0:
+        return table
+
+    positions_by_value = {value: index for index, value in enumerate(vector_dim_values)}
+    key_lists = {name: table.column(name).to_pylist() for name in group_keys}
+    vector_values = table.column(vector_dim).to_pylist()
+    value_lists = {name: table.column(name).to_pylist() for name in value_columns}
+
+    subgroup_values: dict[tuple[object, ...], dict[str, object]] = {}
+    subgroup_vectors: dict[tuple[object, ...], dict[str, list[object | None]]] = {}
+    subgroup_seen_positions: dict[tuple[object, ...], set[int]] = {}
+    row_order: list[tuple[object, ...]] = []
+
+    for row_idx, dim_value in enumerate(vector_values):
+        key = tuple(key_lists[name][row_idx] for name in group_keys)
+        if key not in subgroup_values:
+            subgroup_values[key] = {
+                group_key: key_value for group_key, key_value in zip(group_keys, key, strict=True)
+            }
+            subgroup_vectors[key] = {
+                name: [None] * len(vector_dim_values) for name in value_columns
+            }
+            subgroup_seen_positions[key] = set()
+            row_order.append(key)
+
+        position = positions_by_value.get(dim_value)
+        if position is None:
+            raise ValueError(
+                f"Vectorized dimension value {dim_value!r} was not present in the planned order "
+                f"for dimension {vector_dim!r}."
+            )
+        if position in subgroup_seen_positions[key]:
+            raise ValueError(
+                f"Duplicate vectorized dimension value {dim_value!r} found within a single "
+                f"group for dimension {vector_dim!r}."
+            )
+        subgroup_seen_positions[key].add(position)
+        for name in value_columns:
+            subgroup_vectors[key][name][position] = value_lists[name][row_idx]
+
+    columns: dict[str, pa.Array] = {}
+    for name in group_keys:
+        columns[name] = pa.array(
+            [subgroup_values[key][name] for key in row_order],
+            type=table.schema.field(name).type,
+        )
+    for name in value_columns:
+        columns[name] = pa.array(
+            [subgroup_vectors[key][name] for key in row_order],
+            type=pa.list_(table.schema.field(name).type),
+        )
+
+    logger.info(
+        "vectorized stats input_rows=%d output_rows=%d vector_dim=%s vector_length=%d "
+        "group_keys=%s value_columns=%s",
+        table.num_rows,
+        len(row_order),
+        vector_dim,
+        len(vector_dim_values),
+        group_keys,
+        value_columns,
     )
     return pa.table(columns)
 

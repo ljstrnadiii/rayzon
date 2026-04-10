@@ -321,3 +321,29 @@ def test_finalize_partial_rows_in_feature_group_merges_duplicates_by_full_group_
         {COL_FEATURE_ID: 1, "time": 2024, "band": "A00", "mean": 6.0},
         {COL_FEATURE_ID: 1, "time": 2024, "band": "A01", "mean": 10.0},
     ]
+
+
+def test_finalize_partial_rows_in_feature_group_vectorizes_within_feature_group() -> None:
+    batch = pa.table(
+        {
+            COL_FEATURE_ID: pa.array([1, 1, 1, 1, 1, 1], type=pa.int64()),
+            "time": pa.array([2024, 2024, 2024, 2025, 2025, 2025], type=pa.int64()),
+            "band": pa.array(["A02", "A00", "A01", "A01", "A02", "A00"], type=pa.string()),
+            "_partial_n_valid": pa.array([1, 1, 1, 1, 1, 1], type=pa.int64()),
+            "_partial_sum": pa.array([2.0, 0.0, 1.0, 11.0, 12.0, 10.0], type=pa.float64()),
+        }
+    )
+
+    output = _finalize_partial_rows_in_feature_group(
+        batch,
+        group_keys=[COL_FEATURE_ID, "time", "band"],
+        partial_columns=["_partial_n_valid", "_partial_sum"],
+        requested_stats=["mean"],
+        vectorize_dim="band",
+        vector_dim_values=["A00", "A01", "A02"],
+    )
+
+    assert output.to_pylist() == [
+        {COL_FEATURE_ID: 1, "time": 2024, "mean": [0.0, 1.0, 2.0]},
+        {COL_FEATURE_ID: 1, "time": 2025, "mean": [10.0, 11.0, 12.0]},
+    ]

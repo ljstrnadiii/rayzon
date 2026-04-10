@@ -39,6 +39,7 @@ def zonal_stats(
     decode_coords: bool = False,
     storage_options: Mapping[str, object] | None = None,
     selectors: Mapping[str, object] | None = None,
+    vectorize_dim: str | None = None,
     feature_override_num_blocks: int | None = None,
     shuffle_num_partitions: int | None = None,
     zarr_backend: ZarrBackend = ZarrBackend.ZARR_PYTHON,
@@ -79,6 +80,11 @@ def zonal_stats(
         Optional non-spatial selectors used to subset the array before planning chunk work. Supports
         integer positional indices and xarray-style label-based selectors such as exact coordinate
         matches, datetime strings like ``{"time": "2023"}``, and coordinate slices.
+    vectorize_dim : str | None
+        Optional non-spatial dimension to collapse into list-valued stat columns after zonal
+        statistics are finalized, for example ``"band"`` to produce one row per feature/time
+        with array-valued stat columns ordered by the source zarr coordinate order after selector
+        subsetting.
     feature_override_num_blocks : int | None
         Override the initial Ray Dataset block count for the feature source. For parquet-path
         inputs this is passed to ``ray.data.read_parquet(..., override_num_blocks=...)``.
@@ -128,7 +134,14 @@ def zonal_stats(
         all_touched=all_touched,
     )
 
-    return (
+    if vectorize_dim is not None and vectorize_dim not in plan.non_spatial_dims:
+        raise ValueError(
+            "vectorize_dim must target a non-spatial dimension. "
+            f"Got {vectorize_dim!r}; "
+            f"available dimensions: {plan.non_spatial_dims!r}."
+        )
+
+    result = (
         plan.feature_ds.map_batches(
             map_feature_to_chunk_rows,  # type: ignore[arg-type]
             fn_kwargs={
@@ -153,8 +166,16 @@ def zonal_stats(
                 "group_keys": plan.group_keys,
                 "partial_columns": list(plan.partial_columns),
                 "requested_stats": list(plan.resolved.requested),
+                "vectorize_dim": vectorize_dim,
+                "vector_dim_values": (
+                    list(plan.selected_dim_values[vectorize_dim])
+                    if vectorize_dim is not None
+                    else None
+                ),
             },
             batch_format="pyarrow",
             num_cpus=1,
         )
     )
+
+    return result
