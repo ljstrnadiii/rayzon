@@ -9,6 +9,7 @@ import ray.data
 from affine import Affine
 
 from rayzon.chunk_processor import process_chunk_group
+from rayzon.feature_dataset import _detect_num_blocks
 from rayzon.index import map_feature_to_chunk_rows
 from rayzon.logging_utils import ensure_basic_logging, get_logger
 from rayzon.rasterize_backend import RasterizeBackend
@@ -39,7 +40,9 @@ def zonal_stats(
     decode_coords: bool = False,
     storage_options: Mapping[str, object] | None = None,
     selectors: Mapping[str, object] | None = None,
+    coord_columns: Mapping[str, str | None] | Sequence[str] | None = None,
     vectorize_dim: str | None = None,
+    append_stats: bool = False,
     feature_override_num_blocks: int | None = None,
     shuffle_num_partitions: int | None = None,
     zarr_backend: ZarrBackend = ZarrBackend.ZARR_PYTHON,
@@ -80,11 +83,24 @@ def zonal_stats(
         Optional non-spatial selectors used to subset the array before planning chunk work. Supports
         integer positional indices and xarray-style label-based selectors such as exact coordinate
         matches, datetime strings like ``{"time": "2023"}``, and coordinate slices.
+    coord_columns : Mapping[str, str | None] | Sequence[str] | None
+        Feature columns that align with zarr dimension coordinates. Each key is a feature column
+        name matching a non-spatial zarr dimension. The value is a pandas-style period frequency
+        string controlling match resolution: ``"Y"`` (year), ``"M"`` (year-month), ``"D"`` (day),
+        or ``None`` (exact match with safe cast). For example, ``{"time": "Y"}`` extracts the
+        year from a feature timestamp column to match an integer year coordinate in zarr. This
+        limits chunk processing to only the zarr slices matching each feature's coordinate value
+        and enables precise joining when ``append_stats=True``. Must not overlap with *selectors*
+        on the same dimension.
     vectorize_dim : str | None
         Optional non-spatial dimension to collapse into list-valued stat columns after zonal
         statistics are finalized, for example ``"band"`` to produce one row per feature/time
         with array-valued stat columns ordered by the source zarr coordinate order after selector
         subsetting.
+    append_stats : bool
+        If True, left-join the zonal statistics back onto the input feature dataset before
+        returning. This uses the already-prepared feature dataset from planning, so synthesized
+        ``feature_id`` values remain aligned with the stats result.
     feature_override_num_blocks : int | None
         Override the initial Ray Dataset block count for the feature source. For parquet-path
         inputs this is passed to ``ray.data.read_parquet(..., override_num_blocks=...)``.
@@ -120,6 +136,7 @@ def zonal_stats(
         decode_coords=decode_coords,
         storage_options=storage_options,
         selectors=selectors,
+        coord_columns=coord_columns,
         feature_override_num_blocks=feature_override_num_blocks,
         zarr_backend=zarr_backend,
         rasterize_backend=rasterize_backend,
@@ -140,6 +157,14 @@ def zonal_stats(
             f"Got {vectorize_dim!r}; "
             f"available dimensions: {plan.non_spatial_dims!r}."
         )
+
+    # Map vectorize_dim to its column name in the stats output
+    # (may be a coord col name like __band_coord if coord-aligned)
+    vectorize_col = (
+        plan.coord_col_names.get(vectorize_dim, vectorize_dim)
+        if vectorize_dim is not None
+        else None
+    )
 
     result = (
         plan.feature_ds.map_batches(
@@ -166,7 +191,7 @@ def zonal_stats(
                 "group_keys": plan.group_keys,
                 "partial_columns": list(plan.partial_columns),
                 "requested_stats": list(plan.resolved.requested),
-                "vectorize_dim": vectorize_dim,
+                "vectorize_dim": vectorize_col,
                 "vector_dim_values": (
                     list(plan.selected_dim_values[vectorize_dim])
                     if vectorize_dim is not None
@@ -177,5 +202,24 @@ def zonal_stats(
             num_cpus=1,
         )
     )
+
+    if append_stats:
+        num_partitions = shuffle_num_partitions or max(
+            _detect_num_blocks(plan.feature_ds) or 1,
+            _detect_num_blocks(result) or 1,
+        )
+        stats_dim_cols = [k for k in plan.group_keys if k != COL_FEATURE_ID and k != vectorize_col]
+        feature_cols = set(plan.feature_ds.schema().names)
+        join_keys = tuple([COL_FEATURE_ID] + [c for c in stats_dim_cols if c in feature_cols])
+        joined = plan.feature_ds.join(
+            result,
+            join_type="inner",
+            num_partitions=num_partitions,
+            on=join_keys,  # type: ignore[call-arg]
+        )
+        drop_cols = list(plan.coord_col_names.values())
+        if drop_cols:
+            joined = joined.drop_columns(drop_cols)
+        return joined
 
     return result

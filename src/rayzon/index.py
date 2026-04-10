@@ -47,18 +47,24 @@ def _build_chunk_ids_for_xy(
     grid: GridSpec,
     *,
     allowed_chunk_ids_by_dim: Mapping[str, list[int]] | None = None,
+    per_feature_chunk_ids: Mapping[str, list[int]] | None = None,
 ) -> list[tuple[int, ...]]:
     non_spatial_axes = [i for i in range(len(grid.dims)) if i != grid.y_index and i != grid.x_index]
     non_spatial_ranges: list[Sequence[int]] = []
     for ax in non_spatial_axes:
         dim = grid.dims[ax]
-        allowed = (
-            allowed_chunk_ids_by_dim.get(dim) if allowed_chunk_ids_by_dim is not None else None
-        )
-        if allowed is None:
-            non_spatial_ranges.append(range(math.ceil(grid.shape[ax] / grid.chunk_sizes[ax])))
+        # Per-feature routing takes precedence over global allowed_chunk_ids
+        per_feature = per_feature_chunk_ids.get(dim) if per_feature_chunk_ids is not None else None
+        if per_feature is not None:
+            non_spatial_ranges.append(tuple(per_feature))
         else:
-            non_spatial_ranges.append(tuple(allowed))
+            allowed = (
+                allowed_chunk_ids_by_dim.get(dim) if allowed_chunk_ids_by_dim is not None else None
+            )
+            if allowed is None:
+                non_spatial_ranges.append(range(math.ceil(grid.shape[ax] / grid.chunk_sizes[ax])))
+            else:
+                non_spatial_ranges.append(tuple(allowed))
     if not non_spatial_ranges:
         ids = [0] * len(grid.dims)
         ids[grid.y_index] = chunk_y
@@ -115,6 +121,8 @@ def map_feature_to_chunk_rows(
     x_dim: str,
     y_dim: str,
     allowed_chunk_ids_by_dim: Mapping[str, list[int]] | None = None,
+    coord_to_chunk_ids_by_dim: Mapping[str, Mapping[object, list[int]]] | None = None,
+    coord_col_names: Mapping[str, str] | None = None,
 ) -> pa.Table:
     ensure_basic_logging()
     started_at = perf_counter()
@@ -132,16 +140,30 @@ def map_feature_to_chunk_rows(
     feature_ids = table.column(feature_id_col).to_pylist()
     geom_vals = table.column(geometry_col).to_pylist()
 
+    # Pre-read coord column values for per-feature routing
+    coord_col_values: dict[str, list] = {}
+    if coord_col_names:
+        for dim, col_name in coord_col_names.items():
+            coord_col_values[dim] = table.column(col_name).to_pylist()
+
     out_chunk_keys: list[str] = []
     out_feature_ids: list[int | str] = []
     out_geometries: list[bytes] = []
     total_candidate_spatial_chunks = 0
 
-    for fid, geom_raw in zip(feature_ids, geom_vals, strict=True):
+    for row_idx, (fid, geom_raw) in enumerate(zip(feature_ids, geom_vals, strict=True)):
         feature_id = _normalize_feature_id(fid)
         geom = coerce_geometry(geom_raw)
         geom_wkb = geom.wkb
         minx, miny, maxx, maxy = geom.bounds
+
+        # Build per-feature chunk restriction from coord columns
+        per_feature_chunk_ids: dict[str, list[int]] | None = None
+        if coord_to_chunk_ids_by_dim and coord_col_values:
+            per_feature_chunk_ids = {}
+            for dim, mapping in coord_to_chunk_ids_by_dim.items():
+                coord_val = coord_col_values[dim][row_idx]
+                per_feature_chunk_ids[dim] = mapping.get(coord_val, [])
 
         y_range, x_range = world_bbox_to_chunk_ranges((minx, miny, maxx, maxy), grid_spec)
         total_candidate_spatial_chunks += len(y_range) * len(x_range)
@@ -152,6 +174,7 @@ def map_feature_to_chunk_rows(
                     cx,
                     grid_spec,
                     allowed_chunk_ids_by_dim=allowed_chunk_ids_by_dim,
+                    per_feature_chunk_ids=per_feature_chunk_ids,
                 ):
                     out_chunk_keys.append(_chunk_id_to_key(chunk_id))
                     out_feature_ids.append(feature_id)

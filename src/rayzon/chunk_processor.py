@@ -288,6 +288,8 @@ def process_chunk_group(
     dim_coord_values: dict[str, list],
     allowed_dim_indices: dict[str, list[int]],
     storage_options: dict[str, object],
+    coord_col_names: dict[str, str] | None = None,
+    coord_frequencies: dict[str, str | None] | None = None,
     dims: list[str],
     shape: list[int],
     chunk_sizes: list[int],
@@ -319,6 +321,8 @@ def process_chunk_group(
             non_spatial_dims,
             fid_pa_type=fid_pa_type,
             partial_columns=partial_columns_tuple,
+            coord_col_names=coord_col_names,
+            coord_frequencies=coord_frequencies,
         )
 
     chunk_key = table.column(COL_CHUNK_KEY)[0].as_py()
@@ -368,6 +372,8 @@ def process_chunk_group(
         fid_pa_type=fid_pa_type,
         partial_columns=partial_columns_tuple,
         dim_coord_values=dim_coord_values,
+        coord_col_names=coord_col_names,
+        coord_frequencies=coord_frequencies,
     )
     batch_build_time_s = perf_counter() - batch_build_started_at
     total_time_s = perf_counter() - group_started_at
@@ -406,16 +412,22 @@ def _empty_batch(
     fid_pa_type: pa.DataType,
     partial_columns: tuple[str, ...],
     dim_coord_values: dict[str, list] | None = None,
+    coord_col_names: dict[str, str] | None = None,
+    coord_frequencies: dict[str, str | None] | None = None,
 ) -> pa.Table:
     columns: dict[str, pa.Array] = {COL_FEATURE_ID: pa.array([], type=fid_pa_type)}
     for column in partial_columns:
         columns[column] = pa.array([], type=partial_column_arrow_type(column))
     for dim in non_spatial_dims:
-        if dim_coord_values and dim in dim_coord_values and dim_coord_values[dim]:
+        col_name = (coord_col_names or {}).get(dim, dim)
+        # Coord-aligned dims always use int64 (truncated values)
+        if coord_col_names and dim in coord_col_names:
+            columns[col_name] = pa.array([], type=pa.int64())
+        elif dim_coord_values and dim in dim_coord_values and dim_coord_values[dim]:
             sample = dim_coord_values[dim][0]
-            columns[dim] = pa.array([], type=pa.array([sample]).type)
+            columns[col_name] = pa.array([], type=pa.array([sample]).type)
         else:
-            columns[dim] = pa.array([], type=pa.int64())
+            columns[col_name] = pa.array([], type=pa.int64())
     return pa.table(columns)
 
 
@@ -426,6 +438,8 @@ def _rows_to_batch(
     fid_pa_type: pa.DataType,
     partial_columns: tuple[str, ...],
     dim_coord_values: dict[str, list] | None = None,
+    coord_col_names: dict[str, str] | None = None,
+    coord_frequencies: dict[str, str | None] | None = None,
 ) -> pa.Table:
     if not rows:
         return _empty_batch(
@@ -433,7 +447,11 @@ def _rows_to_batch(
             fid_pa_type=fid_pa_type,
             partial_columns=partial_columns,
             dim_coord_values=dim_coord_values,
+            coord_col_names=coord_col_names,
+            coord_frequencies=coord_frequencies,
         )
+    from rayzon.coord_align import truncate_coord_value
+
     columns: dict[str, pa.Array] = {
         COL_FEATURE_ID: pa.array([r["feature_id"] for r in rows], type=fid_pa_type)
     }
@@ -443,10 +461,25 @@ def _rows_to_batch(
             type=partial_column_arrow_type(column),
         )
     for dim_idx, dim in enumerate(non_spatial_dims):
+        col_name = (coord_col_names or {}).get(dim, dim)
         raw_indices = [cast(tuple[int, ...], r["dim_values"])[dim_idx] for r in rows]
-        if dim_coord_values and dim in dim_coord_values:
+        freq = (coord_frequencies or {}).get(dim)
+        if coord_col_names and dim in coord_col_names:
+            # Coord-aligned dim: look up zarr coord value and truncate
+            if dim_coord_values and dim in dim_coord_values:
+                coord_list = dim_coord_values[dim]
+                columns[col_name] = pa.array(
+                    [truncate_coord_value(coord_list[int(i)], freq) for i in raw_indices],
+                    type=pa.int64(),
+                )
+            else:
+                columns[col_name] = pa.array(
+                    [truncate_coord_value(int(i), freq) for i in raw_indices],
+                    type=pa.int64(),
+                )
+        elif dim_coord_values and dim in dim_coord_values:
             coord_list = dim_coord_values[dim]
-            columns[dim] = pa.array([coord_list[int(i)] for i in raw_indices])
+            columns[col_name] = pa.array([coord_list[int(i)] for i in raw_indices])
         else:
-            columns[dim] = pa.array(raw_indices, type=pa.int64())
+            columns[col_name] = pa.array(raw_indices, type=pa.int64())
     return pa.table(columns)

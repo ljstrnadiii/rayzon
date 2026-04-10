@@ -5,7 +5,10 @@ import pyarrow as pa
 from shapely.geometry import Point
 
 from rayzon.arrow import as_table, geodataframe_to_geoarrow_table
-from rayzon.feature_dataset import _detect_feature_id_type, to_feature_dataset
+from rayzon.feature_dataset import (
+    _detect_feature_id_type,
+    to_feature_dataset,
+)
 from rayzon.types import COL_FEATURE_ID
 
 

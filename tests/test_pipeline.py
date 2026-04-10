@@ -337,3 +337,153 @@ def test_zonal_stats_merges_partial_rows_across_spatial_chunks(tmp_path: Path) -
         pd.Timestamp("2024-01-01"),
     ]
     np.testing.assert_allclose(out["mean"].to_numpy(dtype=np.float64), [8.5, 108.5])
+
+
+def test_zonal_stats_append_stats_joins_back_to_feature_parquet_without_feature_id(
+    tmp_path: Path,
+) -> None:
+    mosaic_path = tmp_path / "mosaic_append_stats.zarr"
+    array = zarr.open_array(
+        str(mosaic_path),
+        mode="w",
+        zarr_format=3,
+        shape=(2, 2),
+        chunks=(2, 2),
+        dtype=np.float32,
+        dimension_names=("y", "x"),
+    )
+    array[:] = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    array.attrs["transform"] = [1.0, 0.0, 0.0, 0.0, -1.0, 2.0]
+    array.attrs["crs"] = "EPSG:4326"
+
+    features = gpd.GeoDataFrame(
+        {
+            "name": ["left", "right"],
+            "geometry": [box(0.0, 0.0, 1.0, 2.0), box(1.0, 0.0, 2.0, 2.0)],
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    feature_path = tmp_path / "features_without_id.parquet"
+    features.to_parquet(feature_path, index=False)
+
+    result_ds = zonal_stats(
+        str(mosaic_path),
+        feature_path,
+        transform=Affine(1.0, 0.0, 0.0, 0.0, -1.0, 2.0),
+        crs=pyproj.CRS("EPSG:4326"),
+        stats=("mean",),
+        append_stats=True,
+    )
+
+    output_path = tmp_path / "stats_appended.parquet"
+    result_ds.write_parquet(str(output_path))
+    out = pd.read_parquet(output_path).sort_values("name").reset_index(drop=True)
+
+    assert len(out) == 2
+    assert set(out.columns) >= {COL_FEATURE_ID, "name", "geometry", "mean"}
+    assert out["name"].tolist() == ["left", "right"]
+    assert out[COL_FEATURE_ID].tolist() == [0, 1]
+    np.testing.assert_allclose(out["mean"].to_numpy(dtype=np.float64), [2.0, 3.0])
+
+
+def test_zonal_stats_coord_columns_year_match(tmp_path: Path) -> None:
+    import xarray as xr
+
+    mosaic_path = tmp_path / "mosaic_coord_col.zarr"
+    data = np.stack(
+        [np.full((4, 4), fill_value=float(yr), dtype=np.float32) for yr in [2023, 2024]]
+    )
+    ds = xr.Dataset(
+        {"data": (("time", "y", "x"), data)},
+        coords={
+            "time": [2023, 2024],
+            "y": np.arange(4.0, 0.0, -1.0),
+            "x": np.arange(0.0, 4.0),
+        },
+    )
+    ds["data"].attrs["transform"] = [1.0, 0.0, 0.0, 0.0, -1.0, 4.0]
+    ds["data"].attrs["crs"] = "EPSG:4326"
+    ds.to_zarr(str(mosaic_path), mode="w", zarr_format=3)
+
+    features = gpd.GeoDataFrame(
+        {
+            COL_FEATURE_ID: ["a", "b"],
+            "time": pd.to_datetime(["2024-01-01", "2024-06-15"]),
+            "geometry": [box(0, 0, 4, 4), box(0, 0, 4, 4)],
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+
+    result_ds = zonal_stats(
+        str(mosaic_path),
+        features,
+        stats=("mean",),
+        array_name="data",
+        decode_coords=True,
+        coord_columns={"time": "Y"},
+    )
+
+    out_path = tmp_path / "stats_coord_col.parquet"
+    result_ds.write_parquet(str(out_path))
+    out = pd.read_parquet(out_path).sort_values(COL_FEATURE_ID).reset_index(drop=True)
+
+    # Both features match year 2024 → mean = 2024.0
+    assert len(out) == 2
+    assert out[COL_FEATURE_ID].tolist() == ["a", "b"]
+    np.testing.assert_allclose(out["mean"].to_numpy(dtype=np.float64), [2024.0, 2024.0])
+
+
+def test_zonal_stats_coord_columns_append_stats_preserves_original_col(tmp_path: Path) -> None:
+    import xarray as xr
+
+    mosaic_path = tmp_path / "mosaic_coord_append.zarr"
+    data = np.full((1, 4, 4), fill_value=42.0, dtype=np.float32)
+    ds = xr.Dataset(
+        {"data": (("time", "y", "x"), data)},
+        coords={
+            "time": [2024],
+            "y": np.arange(4.0, 0.0, -1.0),
+            "x": np.arange(0.0, 4.0),
+        },
+    )
+    ds["data"].attrs["transform"] = [1.0, 0.0, 0.0, 0.0, -1.0, 4.0]
+    ds["data"].attrs["crs"] = "EPSG:4326"
+    ds.to_zarr(str(mosaic_path), mode="w", zarr_format=3)
+
+    features = gpd.GeoDataFrame(
+        {
+            COL_FEATURE_ID: ["a", "b"],
+            "time": pd.to_datetime(["2024-01-01", "2024-06-15"]),
+            "geometry": [box(0, 0, 4, 4), box(0, 0, 4, 4)],
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+
+    result_ds = zonal_stats(
+        str(mosaic_path),
+        features,
+        stats=("mean",),
+        array_name="data",
+        decode_coords=True,
+        coord_columns={"time": "Y"},
+        append_stats=True,
+    )
+
+    out_path = tmp_path / "stats_coord_append.parquet"
+    result_ds.write_parquet(str(out_path))
+    out = pd.read_parquet(out_path).sort_values(COL_FEATURE_ID).reset_index(drop=True)
+
+    assert len(out) == 2
+    # Original time column preserved
+    assert "time" in out.columns
+    assert pd.Timestamp(out.iloc[0]["time"]) == pd.Timestamp("2024-01-01")
+    assert pd.Timestamp(out.iloc[1]["time"]) == pd.Timestamp("2024-06-15")
+    # Synthetic coord col dropped
+    assert "__time_coord" not in out.columns
+    # Stats joined correctly
+    np.testing.assert_allclose(out["mean"].to_numpy(dtype=np.float64), [42.0, 42.0])
+    # Geometry preserved
+    assert "geometry" in out.columns
