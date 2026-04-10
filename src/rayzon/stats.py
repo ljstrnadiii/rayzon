@@ -11,6 +11,9 @@ from ray.data.aggregate import AggregateFnV2, BlockAccessor
 from ray.data.block import Block
 from tdigest import TDigest
 
+from rayzon.arrow import as_table
+from rayzon.logging_utils import get_logger
+
 DEFAULT_STAT_EXPRS: tuple[str, ...] = ("count", "n_valid", "mean", "std")
 
 _QUANTILE_RE = re.compile(r"^p_?(100|[0-9]{1,2})$")
@@ -20,6 +23,8 @@ TDIGEST_DEFAULT_K = 200
 
 PartialValue: TypeAlias = int | float | np.ndarray | list[float] | None
 PartialState: TypeAlias = dict[str, PartialValue]
+
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -219,7 +224,7 @@ class QuantileStat(Stat):
 
 
 def _valid_values(values: np.ndarray) -> np.ndarray:
-    return values[~np.isnan(values)]
+    return cast("np.ndarray", values[~np.isnan(values)])
 
 
 def _valid_sum(values: np.ndarray) -> float:
@@ -470,6 +475,119 @@ def merge_partial_states(
         previous = merged.get(column, field.default)
         merged[column] = field.merge(previous, value)
     return merged
+
+
+def _combine_partial_rows_within_batch(
+    batch: pa.Table,
+    *,
+    group_keys: list[str],
+    partial_columns: list[str],
+) -> pa.Table:
+    table = as_table(batch)
+    if table.num_rows <= 1:
+        return table
+
+    key_lists = [table.column(name).to_pylist() for name in group_keys]
+    partial_lists = {name: table.column(name).to_pylist() for name in partial_columns}
+    include_digest = "_partial_digest" in partial_columns
+
+    merged_rows: dict[tuple[object, ...], dict[str, object]] = {}
+    merged_states: dict[tuple[object, ...], PartialState | None] = {}
+    row_order: list[tuple[object, ...]] = []
+
+    for row_idx in range(table.num_rows):
+        key = tuple(column[row_idx] for column in key_lists)
+        state: PartialState = {name: partial_lists[name][row_idx] for name in partial_columns}
+        if key not in merged_rows:
+            merged_rows[key] = {
+                group_key: key_value for group_key, key_value in zip(group_keys, key, strict=True)
+            }
+            merged_states[key] = state
+            row_order.append(key)
+            continue
+
+        merged_states[key] = merge_partial_states(
+            merged_states[key],
+            state,
+            include_digest=include_digest,
+        )
+
+    if len(row_order) == table.num_rows:
+        logger.info(
+            "block-local combine input_rows=%d output_rows=%d reduction_ratio=%.3f "
+            "group_keys=%s partial_columns=%s",
+            table.num_rows,
+            table.num_rows,
+            1.0,
+            group_keys,
+            partial_columns,
+        )
+        return table
+
+    columns: dict[str, pa.Array] = {}
+    for name in group_keys:
+        values = [merged_rows[key][name] for key in row_order]
+        columns[name] = pa.array(values, type=table.schema.field(name).type)
+    for name in partial_columns:
+        values = [
+            None
+            if merged_states[key] is None
+            else cast("PartialState", merged_states[key]).get(name)
+            for key in row_order
+        ]
+        columns[name] = pa.array(values, type=table.schema.field(name).type)
+    output = pa.table(columns)
+    logger.info(
+        "block-local combine input_rows=%d output_rows=%d reduction_ratio=%.3f "
+        "group_keys=%s partial_columns=%s",
+        table.num_rows,
+        output.num_rows,
+        (output.num_rows / table.num_rows) if table.num_rows else 1.0,
+        group_keys,
+        partial_columns,
+    )
+    return output
+
+
+def _finalize_partial_rows_in_feature_group(
+    batch: pa.Table,
+    *,
+    group_keys: list[str],
+    partial_columns: list[str],
+    requested_stats: list[str],
+) -> pa.Table:
+    combined = _combine_partial_rows_within_batch(
+        batch,
+        group_keys=group_keys,
+        partial_columns=partial_columns,
+    )
+    key_lists = {name: combined.column(name).to_pylist() for name in group_keys}
+    partial_lists = {name: combined.column(name).to_pylist() for name in partial_columns}
+
+    columns: dict[str, pa.Array] = {}
+    for name in group_keys:
+        columns[name] = pa.array(key_lists[name], type=combined.schema.field(name).type)
+
+    stats_by_name = [_stat_for_name(normalize_stat_expr(name)) for name in requested_stats]
+    for name, stat in zip(requested_stats, stats_by_name, strict=True):
+        if stat is None:
+            raise ValueError(f"Unsupported stat expression '{name}'")
+        values = []
+        for row_idx in range(combined.num_rows):
+            state: PartialState = {
+                column: partial_lists[column][row_idx] for column in partial_columns
+            }
+            values.append(stat.finalize_output(state))
+        columns[name] = pa.array(values, type=stat_output_arrow_type(name))
+
+    logger.info(
+        "feature-local finalize input_rows=%d output_rows=%d group_keys=%s requested_stats=%s",
+        batch.num_rows,
+        combined.num_rows,
+        group_keys,
+        requested_stats,
+    )
+    return pa.table(columns)
 
 
 def _stat_partial_fields(stat: Stat) -> tuple[Stat, ...]:

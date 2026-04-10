@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 import numpy as np
 import zarr
 from obstore.store import LocalStore, S3Store
+from zarr.errors import ContainsArrayError
 from zarr.storage import ObjectStore
 
 from rayzon.grid import GridSpec
@@ -209,7 +210,10 @@ def resolve_dim_coords(
         storage_options=storage_options,
     )
     coords: dict[str, list] = {}
-    group = open_zarr_group(store_uri, storage_options=storage_options)
+    try:
+        group = open_zarr_group(store_uri, storage_options=storage_options)
+    except ContainsArrayError:
+        return {dim: list(range(dim_sizes.get(dim, 0))) for dim in non_spatial}
     for dim in non_spatial:
         if dim in group and isinstance(group[dim], zarr.Array):
             coords[dim] = _decode_coord_values(np.asarray(group[dim]), dict(group[dim].attrs))
@@ -241,6 +245,8 @@ def _decode_coord_values(values: np.ndarray, attrs: Mapping[str, Any]) -> list:
 
             calendar = attrs.get("calendar")
             decoded = decode_cf_datetime(values, units, calendar=calendar)
+            if np.issubdtype(decoded.dtype, np.datetime64):
+                return cast("list[Any]", decoded.astype("datetime64[us]").tolist())
             return cast("list[Any]", decoded.tolist())
         except Exception:
             pass

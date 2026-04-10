@@ -1,4 +1,5 @@
 import random
+from typing import Any, cast
 
 import numpy as np
 import pyarrow as pa
@@ -6,6 +7,8 @@ import pytest
 
 from rayzon.stats import (
     _STAT_REGISTRY,
+    _combine_partial_rows_within_batch,
+    _finalize_partial_rows_in_feature_group,
     _finalize_quantile,
     accumulate_partial_state,
     build_aggregations,
@@ -16,6 +19,7 @@ from rayzon.stats import (
     required_partial_columns,
     resolve_stat_exprs,
 )
+from rayzon.types import COL_FEATURE_ID
 
 COL_DIGEST = "_partial_digest"
 COL_MIN = "_partial_min"
@@ -128,7 +132,7 @@ def test_merge_partial_states_respects_include_digest_flag() -> None:
 def test_build_aggregations_preserves_requested_order() -> None:
     resolved = resolve_stat_exprs(["mean", "p95", "count"])
     aggs = build_aggregations(resolved)
-    assert [agg.name for agg in aggs] == ["mean", "p95", "count"]
+    assert [cast("str", cast("Any", agg).name) for agg in aggs] == ["mean", "p95", "count"]
 
 
 @pytest.mark.parametrize("stat_name", sorted(_STAT_REGISTRY))
@@ -228,3 +232,92 @@ def test_tdigest_quantiles_skewed_blocks_are_close() -> None:
         rank_error = _rank_error(values, estimated[q], q)
         np.testing.assert_allclose(rank_error, 0.0, atol=0.004, rtol=0.0)
         np.testing.assert_allclose(estimated[q], exact, rtol=0.02, atol=0.0)
+
+
+def test_combine_partial_rows_within_batch_merges_duplicates() -> None:
+    batch = pa.table(
+        {
+            COL_FEATURE_ID: pa.array([1, 1], type=pa.int64()),
+            "time": pa.array([0, 0], type=pa.int64()),
+            "band": pa.array([2, 2], type=pa.int64()),
+            "_partial_count": pa.array([3, 4], type=pa.int64()),
+            "_partial_sum": pa.array([10.0, 20.0], type=pa.float64()),
+        }
+    )
+
+    output = _combine_partial_rows_within_batch(
+        batch,
+        group_keys=[COL_FEATURE_ID, "time", "band"],
+        partial_columns=["_partial_count", "_partial_sum"],
+    )
+
+    assert output.num_rows == 1
+    row = output.to_pylist()[0]
+    assert row[COL_FEATURE_ID] == 1
+    assert row["_partial_count"] == 7
+    assert row["_partial_sum"] == 30.0
+
+
+def test_combine_partial_rows_within_batch_passes_through_unique_rows() -> None:
+    batch = pa.table(
+        {
+            COL_FEATURE_ID: pa.array([1, 2], type=pa.int64()),
+            "time": pa.array([0, 0], type=pa.int64()),
+            "band": pa.array([2, 3], type=pa.int64()),
+            "_partial_count": pa.array([3, 4], type=pa.int64()),
+        }
+    )
+
+    output = _combine_partial_rows_within_batch(
+        batch,
+        group_keys=[COL_FEATURE_ID, "time", "band"],
+        partial_columns=["_partial_count"],
+    )
+
+    assert output.equals(batch)
+
+
+def test_combine_partial_rows_within_batch_merges_digest_payloads() -> None:
+    batch = pa.table(
+        {
+            COL_FEATURE_ID: pa.array([1, 1], type=pa.int64()),
+            "time": pa.array([0, 0], type=pa.int64()),
+            "band": pa.array([2, 2], type=pa.int64()),
+            "_partial_digest": pa.array([[1.0, 2.0], [3.0, 4.0]], type=pa.list_(pa.float64())),
+        }
+    )
+
+    output = _combine_partial_rows_within_batch(
+        batch,
+        group_keys=[COL_FEATURE_ID, "time", "band"],
+        partial_columns=["_partial_digest"],
+    )
+
+    assert output.num_rows == 1
+    assert output.column("_partial_digest").to_pylist()[0] is not None
+
+
+def test_finalize_partial_rows_in_feature_group_merges_duplicates_by_full_group_key() -> None:
+    batch = pa.table(
+        {
+            COL_FEATURE_ID: pa.array([1, 1, 1], type=pa.int64()),
+            "time": pa.array([2024, 2024, 2024], type=pa.int64()),
+            "band": pa.array(["A00", "A00", "A01"], type=pa.string()),
+            "_partial_n_valid": pa.array([2, 3, 4], type=pa.int64()),
+            "_partial_sum": pa.array([10.0, 20.0, 40.0], type=pa.float64()),
+        }
+    )
+
+    output = _finalize_partial_rows_in_feature_group(
+        batch,
+        group_keys=[COL_FEATURE_ID, "time", "band"],
+        partial_columns=["_partial_n_valid", "_partial_sum"],
+        requested_stats=["mean"],
+    )
+
+    assert output.num_rows == 2
+    rows = sorted(output.to_pylist(), key=lambda row: row["band"])
+    assert rows == [
+        {COL_FEATURE_ID: 1, "time": 2024, "band": "A00", "mean": 6.0},
+        {COL_FEATURE_ID: 1, "time": 2024, "band": "A01", "mean": 10.0},
+    ]
