@@ -9,8 +9,8 @@ from rayzon import GeoParquetDatasink, zonal_stats
 AEF_STORE_URI = "s3://us-west-2.opendata.source.coop/tge-labs/aef-mosaic/"
 AEF_ARRAY_NAME = "embeddings"
 AEF_CRS = pyproj.CRS("EPSG:4326")
-OUTPUT_PATH = "s3://sandbox-wherobots-mosaics-tmp/tmp/aef_iowa_field_mean_vector-gpq-2/"
-INPUT_GEOPARQUET = "s3://sandbox-wherobots-mosaics-tmp/tmp/tg/"
+OUTPUT_PATH = "..."
+INPUT_GEOPARQUET = "..."
 
 
 def main() -> None:
