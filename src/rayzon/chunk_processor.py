@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 import math
+from dataclasses import dataclass
+from time import perf_counter
 from typing import cast
 
 import numpy as np
@@ -13,6 +16,7 @@ from shapely.geometry.base import BaseGeometry
 from rayzon.arrow import as_table
 from rayzon.grid import GridSpec, chunk_id_to_slices, chunk_world_bounds, reconstruct_grid_spec
 from rayzon.index import _chunk_key_to_chunk_id, _normalize_feature_id
+from rayzon.logging_utils import ensure_basic_logging, format_bytes
 from rayzon.rasterize_backend import RasterizeBackend, rasterize_geometry_window
 from rayzon.stats import (
     ALL_PARTIAL_COLUMNS,
@@ -27,6 +31,23 @@ from rayzon.types import (
 )
 from rayzon.zarr_backend import ZarrBackend, open_zarr_array
 
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ChunkProcessingMetrics:
+    read_time_s: float = 0.0
+    rasterize_time_s: float = 0.0
+    stat_time_s: float = 0.0
+    bytes_read: int = 0
+    requested_shape: tuple[int, ...] = ()
+    features_total: int = 0
+    features_intersecting: int = 0
+    masks_built: int = 0
+    planes_processed: int = 0
+    selected_value_count: int = 0
+    rows_emitted: int = 0
+
 
 def process_chunk(
     chunk_id: tuple[int, ...],
@@ -40,11 +61,18 @@ def process_chunk(
     scale_factor: float | None = None,
     add_offset: float | None = None,
     partial_columns: tuple[str, ...] = ALL_PARTIAL_COLUMNS,
+    allowed_dim_indices: dict[str, list[int]] | None = None,
     rasterize_backend: RasterizeBackend = RasterizeBackend.RASTERIO,
 ) -> list[dict[str, object]]:
+    ensure_basic_logging()
+    metrics = ChunkProcessingMetrics(features_total=len(feature_ids))
     partial_fields = partial_fields_for_columns(partial_columns)
     chunk_slices = chunk_id_to_slices(chunk_id, grid_spec)
+    read_started_at = perf_counter()
     chunk_data = np.asarray(array[chunk_slices])
+    metrics.read_time_s = perf_counter() - read_started_at
+    metrics.bytes_read = int(chunk_data.nbytes)
+    metrics.requested_shape = tuple(int(size) for size in chunk_data.shape)
 
     x0, y0, x1, y1 = _chunk_xy_bounds(chunk_id, grid_spec)
     chunk_bounds = chunk_world_bounds(chunk_id, grid_spec)
@@ -61,6 +89,7 @@ def process_chunk(
         local_window = _geometry_local_window(geometry.bounds, grid_spec, x0, y0, x1, y1)
         if local_window is None:
             continue
+        metrics.features_intersecting += 1
 
         lx0, ly0, lx1, ly1 = local_window
         out_shape = (ly1 - ly0, lx1 - lx0)
@@ -69,6 +98,7 @@ def process_chunk(
 
         window_transform = Affine(*grid_spec.transform) * Affine.translation(x0 + lx0, y0 + ly0)
         effective_all_touched = _effective_all_touched(all_touched, geometry.geom_type)
+        rasterize_started_at = perf_counter()
         mask = rasterize_geometry_window(
             geometry,
             out_shape=out_shape,
@@ -76,6 +106,8 @@ def process_chunk(
             all_touched=effective_all_touched,
             rasterize_backend=rasterize_backend,
         )
+        metrics.rasterize_time_s += perf_counter() - rasterize_started_at
+        metrics.masks_built += 1
         if not np.any(mask):
             continue
 
@@ -84,9 +116,17 @@ def process_chunk(
         ]
 
         for dim_values, plane in _iter_spatial_planes(windowed, grid_spec, chunk_slices):
+            if not _dim_values_allowed(
+                dim_values,
+                grid_spec=grid_spec,
+                allowed_dim_indices=allowed_dim_indices,
+            ):
+                continue
+            metrics.planes_processed += 1
             selected = np.asarray(plane)[mask]
             if selected.size == 0:
                 continue
+            metrics.selected_value_count += int(selected.size)
 
             if nodata is not None:
                 selected = np.where(selected == nodata, np.nan, selected)
@@ -96,7 +136,9 @@ def process_chunk(
             ):
                 selected = selected * (scale_factor or 1.0) + (add_offset or 0.0)
 
+            stat_started_at = perf_counter()
             partial_state = accumulate_partial_state(selected, required_fields=partial_fields)
+            metrics.stat_time_s += perf_counter() - stat_started_at
             if partial_state is None:
                 continue
             row: dict[str, object] = {
@@ -107,6 +149,27 @@ def process_chunk(
                 row[column] = partial_state[column]
             rows.append(row)
 
+    metrics.rows_emitted = len(rows)
+    logger.info(
+        "chunk processed chunk_id=%s chunk_slices=%s requested_shape=%s dtype=%s bytes_read=%s "
+        "read_time_s=%.3f rasterize_time_s=%.3f stat_time_s=%.3f features_total=%d "
+        "features_intersecting=%d masks_built=%d planes_processed=%d selected_values=%d "
+        "rows_emitted=%d",
+        chunk_id,
+        chunk_slices,
+        metrics.requested_shape,
+        chunk_data.dtype,
+        format_bytes(metrics.bytes_read),
+        metrics.read_time_s,
+        metrics.rasterize_time_s,
+        metrics.stat_time_s,
+        metrics.features_total,
+        metrics.features_intersecting,
+        metrics.masks_built,
+        metrics.planes_processed,
+        metrics.selected_value_count,
+        metrics.rows_emitted,
+    )
     return rows
 
 
@@ -132,6 +195,22 @@ def _iter_spatial_planes(
             dim_values.append(axis_start + axis_local_idx)
         out.append((tuple(dim_values), np.asarray(windowed[tuple(slicer)])))
     return out
+
+
+def _dim_values_allowed(
+    dim_values: tuple[int, ...],
+    *,
+    grid_spec: GridSpec,
+    allowed_dim_indices: dict[str, list[int]] | None,
+) -> bool:
+    if not allowed_dim_indices:
+        return True
+    non_spatial_dims = [d for d in grid_spec.dims if d not in (grid_spec.y_dim, grid_spec.x_dim)]
+    for dim, value in zip(non_spatial_dims, dim_values, strict=True):
+        allowed = allowed_dim_indices.get(dim)
+        if allowed is not None and int(value) not in allowed:
+            return False
+    return True
 
 
 def _chunk_xy_bounds(chunk_id: tuple[int, ...], grid_spec: GridSpec) -> tuple[int, int, int, int]:
@@ -207,6 +286,10 @@ def process_chunk_group(
     scale_factor: float | None,
     add_offset: float | None,
     dim_coord_values: dict[str, list],
+    allowed_dim_indices: dict[str, list[int]],
+    storage_options: dict[str, object],
+    coord_col_names: dict[str, str] | None = None,
+    coord_frequencies: dict[str, str | None] | None = None,
     dims: list[str],
     shape: list[int],
     chunk_sizes: list[int],
@@ -215,6 +298,8 @@ def process_chunk_group(
     x_dim: str,
     y_dim: str,
 ) -> pa.Table:
+    ensure_basic_logging()
+    group_started_at = perf_counter()
     partial_columns_tuple = tuple(partial_columns)
     grid_spec = reconstruct_grid_spec(
         dims=dims,
@@ -236,6 +321,8 @@ def process_chunk_group(
             non_spatial_dims,
             fid_pa_type=fid_pa_type,
             partial_columns=partial_columns_tuple,
+            coord_col_names=coord_col_names,
+            coord_frequencies=coord_frequencies,
         )
 
     chunk_key = table.column(COL_CHUNK_KEY)[0].as_py()
@@ -245,16 +332,23 @@ def process_chunk_group(
     geom_wkbs = table.column(COL_GEOMETRY).to_pylist()
 
     geometry_store: dict[int | str, BaseGeometry] = {}
+    geometry_decode_started_at = perf_counter()
     for fid, gwkb in zip(feature_ids_raw, geom_wkbs, strict=True):
         fid_norm = _normalize_feature_id(fid)
         if fid_norm not in geometry_store:
             geometry_store[fid_norm] = from_wkb(bytes(gwkb))
+    geometry_decode_time_s = perf_counter() - geometry_decode_started_at
 
+    open_started_at = perf_counter()
     array = open_zarr_array(
         store_uri,
         array_name=array_name or None,
         zarr_backend=zarr_backend,
+        storage_options=storage_options,
     )
+    open_time_s = perf_counter() - open_started_at
+
+    process_started_at = perf_counter()
     rows = process_chunk(
         chunk_id=chunk_id,
         feature_ids=list(geometry_store.keys()),
@@ -266,15 +360,43 @@ def process_chunk_group(
         scale_factor=scale_factor,
         add_offset=add_offset,
         partial_columns=partial_columns_tuple,
+        allowed_dim_indices=allowed_dim_indices,
         rasterize_backend=rasterize_backend,
     )
-    return _rows_to_batch(
+    process_time_s = perf_counter() - process_started_at
+
+    batch_build_started_at = perf_counter()
+    out = _rows_to_batch(
         rows,
         non_spatial_dims,
         fid_pa_type=fid_pa_type,
         partial_columns=partial_columns_tuple,
         dim_coord_values=dim_coord_values,
+        coord_col_names=coord_col_names,
+        coord_frequencies=coord_frequencies,
     )
+    batch_build_time_s = perf_counter() - batch_build_started_at
+    total_time_s = perf_counter() - group_started_at
+    logger.info(
+        "chunk group processed chunk_key=%s chunk_id=%s input_rows=%d unique_features=%d "
+        "geometry_decode_time_s=%.3f array_open_time_s=%.3f process_time_s=%.3f "
+        "batch_build_time_s=%.3f total_time_s=%.3f array_shape=%s chunks=%s shards=%s "
+        "output_rows=%d",
+        chunk_key,
+        chunk_id,
+        table.num_rows,
+        len(geometry_store),
+        geometry_decode_time_s,
+        open_time_s,
+        process_time_s,
+        batch_build_time_s,
+        total_time_s,
+        array.shape,
+        array.chunks,
+        getattr(array, "shards", None),
+        out.num_rows,
+    )
+    return out
 
 
 def _resolve_fid_type(type_str: str) -> pa.DataType:
@@ -290,16 +412,22 @@ def _empty_batch(
     fid_pa_type: pa.DataType,
     partial_columns: tuple[str, ...],
     dim_coord_values: dict[str, list] | None = None,
+    coord_col_names: dict[str, str] | None = None,
+    coord_frequencies: dict[str, str | None] | None = None,
 ) -> pa.Table:
     columns: dict[str, pa.Array] = {COL_FEATURE_ID: pa.array([], type=fid_pa_type)}
     for column in partial_columns:
         columns[column] = pa.array([], type=partial_column_arrow_type(column))
     for dim in non_spatial_dims:
-        if dim_coord_values and dim in dim_coord_values and dim_coord_values[dim]:
+        col_name = (coord_col_names or {}).get(dim, dim)
+        # Coord-aligned dims always use int64 (truncated values)
+        if coord_col_names and dim in coord_col_names:
+            columns[col_name] = pa.array([], type=pa.int64())
+        elif dim_coord_values and dim in dim_coord_values and dim_coord_values[dim]:
             sample = dim_coord_values[dim][0]
-            columns[dim] = pa.array([], type=pa.array([sample]).type)
+            columns[col_name] = pa.array([], type=pa.array([sample]).type)
         else:
-            columns[dim] = pa.array([], type=pa.int64())
+            columns[col_name] = pa.array([], type=pa.int64())
     return pa.table(columns)
 
 
@@ -310,6 +438,8 @@ def _rows_to_batch(
     fid_pa_type: pa.DataType,
     partial_columns: tuple[str, ...],
     dim_coord_values: dict[str, list] | None = None,
+    coord_col_names: dict[str, str] | None = None,
+    coord_frequencies: dict[str, str | None] | None = None,
 ) -> pa.Table:
     if not rows:
         return _empty_batch(
@@ -317,7 +447,11 @@ def _rows_to_batch(
             fid_pa_type=fid_pa_type,
             partial_columns=partial_columns,
             dim_coord_values=dim_coord_values,
+            coord_col_names=coord_col_names,
+            coord_frequencies=coord_frequencies,
         )
+    from rayzon.coord_align import truncate_coord_value
+
     columns: dict[str, pa.Array] = {
         COL_FEATURE_ID: pa.array([r["feature_id"] for r in rows], type=fid_pa_type)
     }
@@ -327,10 +461,25 @@ def _rows_to_batch(
             type=partial_column_arrow_type(column),
         )
     for dim_idx, dim in enumerate(non_spatial_dims):
+        col_name = (coord_col_names or {}).get(dim, dim)
         raw_indices = [cast(tuple[int, ...], r["dim_values"])[dim_idx] for r in rows]
-        if dim_coord_values and dim in dim_coord_values:
+        freq = (coord_frequencies or {}).get(dim)
+        if coord_col_names and dim in coord_col_names:
+            # Coord-aligned dim: look up zarr coord value and truncate
+            if dim_coord_values and dim in dim_coord_values:
+                coord_list = dim_coord_values[dim]
+                columns[col_name] = pa.array(
+                    [truncate_coord_value(coord_list[int(i)], freq) for i in raw_indices],
+                    type=pa.int64(),
+                )
+            else:
+                columns[col_name] = pa.array(
+                    [truncate_coord_value(int(i), freq) for i in raw_indices],
+                    type=pa.int64(),
+                )
+        elif dim_coord_values and dim in dim_coord_values:
             coord_list = dim_coord_values[dim]
-            columns[dim] = pa.array([coord_list[int(i)] for i in raw_indices])
+            columns[col_name] = pa.array([coord_list[int(i)] for i in raw_indices])
         else:
-            columns[dim] = pa.array(raw_indices, type=pa.int64())
+            columns[col_name] = pa.array(raw_indices, type=pa.int64())
     return pa.table(columns)

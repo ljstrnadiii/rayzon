@@ -1,61 +1,36 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import pyarrow as pa
 import pyproj
 import ray.data
 from affine import Affine
 
-from rayzon.arrow import geodataframe_to_geoarrow_table
 from rayzon.chunk_processor import process_chunk_group
+from rayzon.feature_dataset import _detect_num_blocks
 from rayzon.index import map_feature_to_chunk_rows
+from rayzon.logging_utils import ensure_basic_logging, get_logger
 from rayzon.rasterize_backend import RasterizeBackend
-from rayzon.stats import (
-    DEFAULT_STAT_EXPRS,
-    build_aggregations,
-    required_partial_columns,
-    resolve_stat_exprs,
-)
+from rayzon.stats import DEFAULT_STAT_EXPRS, _finalize_partial_rows_in_feature_group
 from rayzon.types import COL_CHUNK_KEY, COL_FEATURE_ID, COL_GEOMETRY
-from rayzon.zarr_backend import ZarrBackend, build_grid_spec, resolve_dim_coords
+from rayzon.zarr_backend import ZarrBackend
+from rayzon.zonal_plan import _log_zonal_stats_plan, build_zonal_stats_plan
 
 if TYPE_CHECKING:
     import geopandas as gpd
 
 
-def to_feature_dataset(
-    feature_source: gpd.GeoDataFrame | str | Path | ray.data.Dataset,
-) -> ray.data.Dataset:
-    if isinstance(feature_source, ray.data.Dataset):
-        return feature_source
-    if isinstance(feature_source, str | Path):
-        return ray.data.read_parquet(str(feature_source))
-
-    try:
-        import geopandas as geopandas
-    except ImportError as exc:
-        raise ImportError(
-            "GeoDataFrame support requires geopandas. "
-            "Install with the 'geopandas' extra, for example "
-            '`pip install "rayzon[geopandas]"` or '
-            '`uv pip install "rayzon[geopandas]"`.'
-        ) from exc
-
-    if isinstance(feature_source, geopandas.GeoDataFrame):
-        return ray.data.from_arrow(geodataframe_to_geoarrow_table(feature_source))
-
-    raise TypeError("feature_source must be a Ray Dataset, GeoDataFrame, or parquet path")
+logger = get_logger(__name__)
 
 
 def zonal_stats(
     store_uri: str,
     features: gpd.GeoDataFrame | str | Path | ray.data.Dataset,
     *,
-    transform: Affine,
-    crs: pyproj.CRS,
+    transform: Affine | None = None,
+    crs: pyproj.CRS | None = None,
     x_dim: str = "x",
     y_dim: str = "y",
     stats: Sequence[str] = DEFAULT_STAT_EXPRS,
@@ -63,6 +38,13 @@ def zonal_stats(
     all_touched: bool = False,
     nodata: float | int | None = None,
     decode_coords: bool = False,
+    storage_options: Mapping[str, object] | None = None,
+    selectors: Mapping[str, object] | None = None,
+    coord_columns: Mapping[str, str | None] | Sequence[str] | None = None,
+    vectorize_dim: str | None = None,
+    append_stats: bool = False,
+    feature_override_num_blocks: int | None = None,
+    shuffle_num_partitions: int | None = None,
     zarr_backend: ZarrBackend = ZarrBackend.ZARR_PYTHON,
     rasterize_backend: RasterizeBackend = RasterizeBackend.RASTERIO,
 ) -> ray.data.Dataset:
@@ -75,10 +57,10 @@ def zonal_stats(
         zarr group (e.g. written by xarray), point at the group root and set *array_name*.
     features : GeoDataFrame | str | Path | ray.data.Dataset
         Geometries to compute statistics for. Must be in the same CRS as *crs*.
-    transform : Affine
-        The Affine transform of the raster data.
-    crs : pyproj.CRS
-        Coordinate reference system of the raster data.
+    transform : Affine | None
+        The Affine transform of the raster data. If omitted, infer from array or root-group attrs.
+    crs : pyproj.CRS | None
+        Coordinate reference system of the raster data. If omitted, infer from attrs.
     x_dim, y_dim : str
         Names of the spatial dimensions in the zarr array.
     stats : Sequence[str]
@@ -94,6 +76,40 @@ def zonal_stats(
         If True, use xarray to decode coordinate values for non-spatial dimensions.  Requires the
         ``xarray`` extra. Otherwise, values in the final dataset will be the corresponding integer
         indices along each non-spatial dimension.
+    storage_options : Mapping[str, object] | None
+        Backend-specific storage options for opening the zarr store, e.g. ``{"anon": True}`` for
+        public S3 buckets.
+    selectors : Mapping[str, object] | None
+        Optional non-spatial selectors used to subset the array before planning chunk work. Supports
+        integer positional indices and xarray-style label-based selectors such as exact coordinate
+        matches, datetime strings like ``{"time": "2023"}``, and coordinate slices.
+    coord_columns : Mapping[str, str | None] | Sequence[str] | None
+        Feature columns that align with zarr dimension coordinates. Each key is a feature column
+        name matching a non-spatial zarr dimension. The value is a pandas-style period frequency
+        string controlling match resolution: ``"Y"`` (year), ``"M"`` (year-month), ``"D"`` (day),
+        or ``None`` (exact match with safe cast). For example, ``{"time": "Y"}`` extracts the
+        year from a feature timestamp column to match an integer year coordinate in zarr. This
+        limits chunk processing to only the zarr slices matching each feature's coordinate value
+        and enables precise joining when ``append_stats=True``. Must not overlap with *selectors*
+        on the same dimension.
+    vectorize_dim : str | None
+        Optional non-spatial dimension to collapse into list-valued stat columns after zonal
+        statistics are finalized, for example ``"band"`` to produce one row per feature/time
+        with array-valued stat columns ordered by the source zarr coordinate order after selector
+        subsetting.
+    append_stats : bool
+        If True, left-join the zonal statistics back onto the input feature dataset before
+        returning. This uses the already-prepared feature dataset from planning, so synthesized
+        ``feature_id`` values remain aligned with the stats result.
+    feature_override_num_blocks : int | None
+        Override the initial Ray Dataset block count for the feature source. For parquet-path
+        inputs this is passed to ``ray.data.read_parquet(..., override_num_blocks=...)``.
+        For GeoDataFrame and Ray Dataset inputs, the loaded dataset is repartitioned to this block
+        count. Use this to control upstream feature-task parallelism independently of downstream
+        groupby shuffle partitioning.
+    shuffle_num_partitions : int | None
+        Number of hash-shuffle partitions to use for the internal Ray Dataset groupby stages.
+        Set this explicitly for local runs to avoid oversharding, e.g. ``8``.
     zarr_backend : ZarrBackend
         Backend for reading zarr data. Defaults to ZARR_PYTHON.
     rasterize_backend : RasterizeBackend
@@ -105,110 +121,105 @@ def zonal_stats(
         One row per (feature, non-spatial dim combination) with the requested
         stat columns.
     """
-    resolved = resolve_stat_exprs(list(stats))
-    partial_columns = required_partial_columns(resolved)
-    transform_tuple = (transform.a, transform.b, transform.c, transform.d, transform.e, transform.f)
-    crs_wkt = crs.to_wkt()
-
-    grid_spec, _, scale_factor, add_offset = build_grid_spec(
+    ensure_basic_logging()
+    plan = build_zonal_stats_plan(
         store_uri,
+        features=features,
+        transform=transform,
+        crs=crs,
         x_dim=x_dim,
         y_dim=y_dim,
-        transform=transform_tuple,
-        crs=crs_wkt,
+        stats=stats,
         array_name=array_name,
+        all_touched=all_touched,
+        nodata=nodata,
+        decode_coords=decode_coords,
+        storage_options=storage_options,
+        selectors=selectors,
+        coord_columns=coord_columns,
+        feature_override_num_blocks=feature_override_num_blocks,
         zarr_backend=zarr_backend,
+        rasterize_backend=rasterize_backend,
     )
-    non_spatial_dims = [dim for dim in grid_spec.dims if dim not in (y_dim, x_dim)]
+    _log_zonal_stats_plan(
+        plan=plan,
+        store_uri=store_uri,
+        array_name=array_name,
+        shuffle_num_partitions=shuffle_num_partitions,
+        feature_override_num_blocks=feature_override_num_blocks,
+        decode_coords=decode_coords,
+        all_touched=all_touched,
+    )
 
-    dim_coord_values: dict[str, list] = {}
-    if decode_coords and non_spatial_dims:
-        dim_coord_values = resolve_dim_coords(
-            store_uri,
-            dims=grid_spec.dims,
-            x_dim=x_dim,
-            y_dim=y_dim,
-            array_name=array_name,
+    if vectorize_dim is not None and vectorize_dim not in plan.non_spatial_dims:
+        raise ValueError(
+            "vectorize_dim must target a non-spatial dimension. "
+            f"Got {vectorize_dim!r}; "
+            f"available dimensions: {plan.non_spatial_dims!r}."
         )
 
-    _check_feature_crs(features, crs)
-    feature_ds = to_feature_dataset(features)
-    feature_id_pa_type = _detect_feature_id_type(feature_ds)
+    # Map vectorize_dim to its column name in the stats output
+    # (may be a coord col name like __band_coord if coord-aligned)
+    vectorize_col = (
+        plan.coord_col_names.get(vectorize_dim, vectorize_dim)
+        if vectorize_dim is not None
+        else None
+    )
 
-    grid_kwargs: dict[str, object] = {
-        "dims": list(grid_spec.dims),
-        "shape": list(grid_spec.shape),
-        "chunk_sizes": list(grid_spec.chunk_sizes),
-        "transform_coeffs": list(grid_spec.transform),
-        "crs": grid_spec.crs,
-        "x_dim": x_dim,
-        "y_dim": y_dim,
-    }
-    chunk_kwargs = {
-        "store_uri": store_uri,
-        "array_name": array_name or "",
-        "all_touched": all_touched,
-        "nodata": nodata,
-        "zarr_backend_value": zarr_backend.value,
-        "rasterize_backend_value": rasterize_backend.value,
-        "partial_columns": list(partial_columns),
-        "feature_id_pa_type": str(feature_id_pa_type),
-        "scale_factor": scale_factor,
-        "add_offset": add_offset,
-        "dim_coord_values": dim_coord_values,
-        **grid_kwargs,
-    }
-
-    group_keys = [COL_FEATURE_ID] + non_spatial_dims
-    aggs = build_aggregations(resolved)
-
-    return (
-        feature_ds.map_batches(
+    result = (
+        plan.feature_ds.map_batches(
             map_feature_to_chunk_rows,  # type: ignore[arg-type]
             fn_kwargs={
                 "feature_id_col": COL_FEATURE_ID,
                 "geometry_col": COL_GEOMETRY,
-                **grid_kwargs,
+                **plan.feature_map_kwargs,
             },
             batch_format="pyarrow",
+            num_cpus=0.1,
         )
-        .groupby(COL_CHUNK_KEY)
+        .groupby(COL_CHUNK_KEY, num_partitions=shuffle_num_partitions)
         .map_groups(
             process_chunk_group,  # type: ignore[arg-type]
-            fn_kwargs=chunk_kwargs,
+            fn_kwargs=plan.chunk_kwargs,
             batch_format="pyarrow",
+            num_cpus=1,
         )
-        .groupby(group_keys)
-        .aggregate(*aggs)
+        .groupby(COL_FEATURE_ID, num_partitions=shuffle_num_partitions)
+        .map_groups(
+            _finalize_partial_rows_in_feature_group,  # type: ignore[arg-type]
+            fn_kwargs={
+                "group_keys": plan.group_keys,
+                "partial_columns": list(plan.partial_columns),
+                "requested_stats": list(plan.resolved.requested),
+                "vectorize_dim": vectorize_col,
+                "vector_dim_values": (
+                    list(plan.selected_dim_values[vectorize_dim])
+                    if vectorize_dim is not None
+                    else None
+                ),
+            },
+            batch_format="pyarrow",
+            num_cpus=1,
+        )
     )
 
-
-def _detect_feature_id_type(ds: ray.data.Dataset) -> pa.DataType:
-    schema = ds.schema()
-    if schema is not None and hasattr(schema, "field"):
-        try:
-            return schema.field(COL_FEATURE_ID).type
-        except (KeyError, AttributeError):
-            pass
-    return pa.string()
-
-
-def _check_feature_crs(
-    features: gpd.GeoDataFrame | str | Path | ray.data.Dataset,
-    crs: pyproj.CRS,
-) -> None:
-    try:
-        import geopandas  # noqa: F811
-    except ImportError:
-        return
-    if not isinstance(features, geopandas.GeoDataFrame):
-        return
-    if features.crs is None:
-        return
-    feature_crs = pyproj.CRS(features.crs)
-    if not feature_crs.equals(crs):
-        raise ValueError(
-            f"Feature CRS ({feature_crs.to_epsg() or feature_crs.to_wkt()}) does not match "
-            f"the raster CRS ({crs.to_epsg() or crs.to_wkt()}). "
-            "Reproject your features to match the raster CRS before calling zonal_stats."
+    if append_stats:
+        num_partitions = shuffle_num_partitions or max(
+            _detect_num_blocks(plan.feature_ds) or 1,
+            _detect_num_blocks(result) or 1,
         )
+        stats_dim_cols = [k for k in plan.group_keys if k != COL_FEATURE_ID and k != vectorize_col]
+        feature_cols = set(plan.feature_ds.schema().names)
+        join_keys = tuple([COL_FEATURE_ID] + [c for c in stats_dim_cols if c in feature_cols])
+        joined = plan.feature_ds.join(
+            result,
+            join_type="inner",
+            num_partitions=num_partitions,
+            on=join_keys,  # type: ignore[call-arg]
+        )
+        drop_cols = list(plan.coord_col_names.values())
+        if drop_cols:
+            joined = joined.drop_columns(drop_cols)
+        return joined
+
+    return result

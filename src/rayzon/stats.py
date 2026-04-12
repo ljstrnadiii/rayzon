@@ -11,6 +11,9 @@ from ray.data.aggregate import AggregateFnV2, BlockAccessor
 from ray.data.block import Block
 from tdigest import TDigest
 
+from rayzon.arrow import as_table
+from rayzon.logging_utils import get_logger
+
 DEFAULT_STAT_EXPRS: tuple[str, ...] = ("count", "n_valid", "mean", "std")
 
 _QUANTILE_RE = re.compile(r"^p_?(100|[0-9]{1,2})$")
@@ -20,6 +23,8 @@ TDIGEST_DEFAULT_K = 200
 
 PartialValue: TypeAlias = int | float | np.ndarray | list[float] | None
 PartialState: TypeAlias = dict[str, PartialValue]
+
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -219,7 +224,7 @@ class QuantileStat(Stat):
 
 
 def _valid_values(values: np.ndarray) -> np.ndarray:
-    return values[~np.isnan(values)]
+    return cast("np.ndarray", values[~np.isnan(values)])
 
 
 def _valid_sum(values: np.ndarray) -> float:
@@ -417,6 +422,15 @@ def partial_column_arrow_type(column: str) -> pa.DataType:
     return field.arrow_type
 
 
+def stat_output_arrow_type(expr: str) -> pa.DataType:
+    stat = _stat_for_name(normalize_stat_expr(expr))
+    if stat is None or stat.stat_name is None:
+        raise ValueError(f"Unsupported stat expression '{expr}'")
+    if stat.stat_name in {"count", "n_valid"}:
+        return pa.int64()
+    return pa.float64()
+
+
 def accumulate_partial_state(
     values: np.ndarray,
     *,
@@ -461,6 +475,207 @@ def merge_partial_states(
         previous = merged.get(column, field.default)
         merged[column] = field.merge(previous, value)
     return merged
+
+
+def _combine_partial_rows_within_batch(
+    batch: pa.Table,
+    *,
+    group_keys: list[str],
+    partial_columns: list[str],
+) -> pa.Table:
+    table = as_table(batch)
+    if table.num_rows <= 1:
+        return table
+
+    key_lists = [table.column(name).to_pylist() for name in group_keys]
+    partial_lists = {name: table.column(name).to_pylist() for name in partial_columns}
+    include_digest = "_partial_digest" in partial_columns
+
+    merged_rows: dict[tuple[object, ...], dict[str, object]] = {}
+    merged_states: dict[tuple[object, ...], PartialState | None] = {}
+    row_order: list[tuple[object, ...]] = []
+
+    for row_idx in range(table.num_rows):
+        key = tuple(column[row_idx] for column in key_lists)
+        state: PartialState = {name: partial_lists[name][row_idx] for name in partial_columns}
+        if key not in merged_rows:
+            merged_rows[key] = {
+                group_key: key_value for group_key, key_value in zip(group_keys, key, strict=True)
+            }
+            merged_states[key] = state
+            row_order.append(key)
+            continue
+
+        merged_states[key] = merge_partial_states(
+            merged_states[key],
+            state,
+            include_digest=include_digest,
+        )
+
+    if len(row_order) == table.num_rows:
+        logger.info(
+            "block-local combine input_rows=%d output_rows=%d reduction_ratio=%.3f "
+            "group_keys=%s partial_columns=%s",
+            table.num_rows,
+            table.num_rows,
+            1.0,
+            group_keys,
+            partial_columns,
+        )
+        return table
+
+    columns: dict[str, pa.Array] = {}
+    for name in group_keys:
+        values = [merged_rows[key][name] for key in row_order]
+        columns[name] = pa.array(values, type=table.schema.field(name).type)
+    for name in partial_columns:
+        values = [
+            None
+            if merged_states[key] is None
+            else cast("PartialState", merged_states[key]).get(name)
+            for key in row_order
+        ]
+        columns[name] = pa.array(values, type=table.schema.field(name).type)
+    output = pa.table(columns)
+    logger.info(
+        "block-local combine input_rows=%d output_rows=%d reduction_ratio=%.3f "
+        "group_keys=%s partial_columns=%s",
+        table.num_rows,
+        output.num_rows,
+        (output.num_rows / table.num_rows) if table.num_rows else 1.0,
+        group_keys,
+        partial_columns,
+    )
+    return output
+
+
+def _finalize_partial_rows_in_feature_group(
+    batch: pa.Table,
+    *,
+    group_keys: list[str],
+    partial_columns: list[str],
+    requested_stats: list[str],
+    vectorize_dim: str | None = None,
+    vector_dim_values: list[object] | None = None,
+) -> pa.Table:
+    combined = _combine_partial_rows_within_batch(
+        batch,
+        group_keys=group_keys,
+        partial_columns=partial_columns,
+    )
+    key_lists = {name: combined.column(name).to_pylist() for name in group_keys}
+    partial_lists = {name: combined.column(name).to_pylist() for name in partial_columns}
+
+    columns: dict[str, pa.Array] = {}
+    for name in group_keys:
+        columns[name] = pa.array(key_lists[name], type=combined.schema.field(name).type)
+
+    stats_by_name = [_stat_for_name(normalize_stat_expr(name)) for name in requested_stats]
+    for name, stat in zip(requested_stats, stats_by_name, strict=True):
+        if stat is None:
+            raise ValueError(f"Unsupported stat expression '{name}'")
+        values = []
+        for row_idx in range(combined.num_rows):
+            state: PartialState = {
+                column: partial_lists[column][row_idx] for column in partial_columns
+            }
+            values.append(stat.finalize_output(state))
+        columns[name] = pa.array(values, type=stat_output_arrow_type(name))
+
+    logger.info(
+        "feature-local finalize input_rows=%d output_rows=%d group_keys=%s requested_stats=%s",
+        batch.num_rows,
+        combined.num_rows,
+        group_keys,
+        requested_stats,
+    )
+    output = pa.table(columns)
+    if vectorize_dim is None:
+        return output
+    if vector_dim_values is None:
+        raise ValueError("vector_dim_values must be provided when vectorize_dim is set.")
+    vector_group_keys = [key for key in group_keys if key != vectorize_dim]
+    return _vectorize_stats_rows_in_group(
+        output,
+        group_keys=vector_group_keys,
+        vector_dim=vectorize_dim,
+        vector_dim_values=vector_dim_values,
+        value_columns=requested_stats,
+    )
+
+
+def _vectorize_stats_rows_in_group(
+    batch: pa.Table,
+    *,
+    group_keys: list[str],
+    vector_dim: str,
+    vector_dim_values: list[object],
+    value_columns: list[str],
+) -> pa.Table:
+    table = as_table(batch)
+    if table.num_rows == 0:
+        return table
+
+    positions_by_value = {value: index for index, value in enumerate(vector_dim_values)}
+    key_lists = {name: table.column(name).to_pylist() for name in group_keys}
+    vector_values = table.column(vector_dim).to_pylist()
+    value_lists = {name: table.column(name).to_pylist() for name in value_columns}
+
+    subgroup_values: dict[tuple[object, ...], dict[str, object]] = {}
+    subgroup_vectors: dict[tuple[object, ...], dict[str, list[object | None]]] = {}
+    subgroup_seen_positions: dict[tuple[object, ...], set[int]] = {}
+    row_order: list[tuple[object, ...]] = []
+
+    for row_idx, dim_value in enumerate(vector_values):
+        key = tuple(key_lists[name][row_idx] for name in group_keys)
+        if key not in subgroup_values:
+            subgroup_values[key] = {
+                group_key: key_value for group_key, key_value in zip(group_keys, key, strict=True)
+            }
+            subgroup_vectors[key] = {
+                name: [None] * len(vector_dim_values) for name in value_columns
+            }
+            subgroup_seen_positions[key] = set()
+            row_order.append(key)
+
+        position = positions_by_value.get(dim_value)
+        if position is None:
+            raise ValueError(
+                f"Vectorized dimension value {dim_value!r} was not present in the planned order "
+                f"for dimension {vector_dim!r}."
+            )
+        if position in subgroup_seen_positions[key]:
+            raise ValueError(
+                f"Duplicate vectorized dimension value {dim_value!r} found within a single "
+                f"group for dimension {vector_dim!r}."
+            )
+        subgroup_seen_positions[key].add(position)
+        for name in value_columns:
+            subgroup_vectors[key][name][position] = value_lists[name][row_idx]
+
+    columns: dict[str, pa.Array] = {}
+    for name in group_keys:
+        columns[name] = pa.array(
+            [subgroup_values[key][name] for key in row_order],
+            type=table.schema.field(name).type,
+        )
+    for name in value_columns:
+        columns[name] = pa.array(
+            [subgroup_vectors[key][name] for key in row_order],
+            type=pa.list_(table.schema.field(name).type),
+        )
+
+    logger.info(
+        "vectorized stats input_rows=%d output_rows=%d vector_dim=%s vector_length=%d "
+        "group_keys=%s value_columns=%s",
+        table.num_rows,
+        len(row_order),
+        vector_dim,
+        len(vector_dim_values),
+        group_keys,
+        value_columns,
+    )
+    return pa.table(columns)
 
 
 def _stat_partial_fields(stat: Stat) -> tuple[Stat, ...]:
