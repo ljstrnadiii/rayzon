@@ -1,9 +1,12 @@
+__version__ = "0.1.0a0"
+
 from rayzon.geoparquet_sink import GeoParquetDatasink
 from rayzon.pipeline import zonal_stats
 from rayzon.rasterize_backend import RasterizeBackend
 from rayzon.zarr_backend import ZarrBackend
 
 __all__ = [
+    "__version__",
     "GeoParquetDatasink",
     "ZarrBackend",
     "RasterizeBackend",
