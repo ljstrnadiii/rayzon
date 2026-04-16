@@ -39,8 +39,18 @@ PyArrow form, reducing conversion overhead and keeping feature transport efficie
 
 ## Development
 
-- Install dependencies: `uv sync --extra dev --extra geo`
+- Install dependencies: `uv sync --extra dev --extra geopandas --extra xarray`
 - Run lint: `uv run ruff check .`
 - Run format check: `uv run ruff format --check .`
 - Run type check: `uv run mypy src`
 - Run tests: `uv run pytest`
+
+## Release
+
+Releases are cut automatically from `main` after the `CI` workflow passes. Use Conventional
+Commits for changes that should trigger a release, and semantic-release will:
+
+- compute the next version
+- update `pyproject.toml`
+- create the version tag and GitHub release
+- build and publish the package to PyPI via GitHub Actions trusted publishing
