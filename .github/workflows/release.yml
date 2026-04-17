@@ -26,6 +26,9 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.workflow_run.head_sha }}
 
+      - name: Attach checkout to source branch
+        run: git switch -C "${{ github.event.workflow_run.head_branch }}"
+
       - uses: astral-sh/setup-uv@v5
 
       - uses: actions/setup-python@v5

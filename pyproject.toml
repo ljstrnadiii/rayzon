@@ -76,6 +76,11 @@ version_toml = ["pyproject.toml:project.version"]
 version_variables = ["src/rayzon/__init__.py:__version__"]
 branch = "main"
 commit_message = "chore(release): v{version}"
+build_command = """
+python -m pip install "uv>=0.7,<0.8"
+uv lock --upgrade-package "$PACKAGE_NAME"
+git add uv.lock
+"""
 allow_zero_version = true
 major_on_zero = false
 tag_format = "v{version}"

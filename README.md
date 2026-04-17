@@ -1,4 +1,7 @@
-# `rayzon` (Ray Zonal Statistics on Zarr)
+# `rayzon`
+[![CI](https://github.com/ljstrnadiii/rayzon/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ljstrnadiii/rayzon/actions/workflows/ci.yml)
+[![Release](https://github.com/ljstrnadiii/rayzon/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/ljstrnadiii/rayzon/actions/workflows/release.yml)
+
 `rayzon` is a ray project to execute zonal statistics on zarr arrays.
 
 It is designed for workflows where:
@@ -36,6 +39,22 @@ PyArrow form, reducing conversion overhead and keeping feature transport efficie
 - Windowed rasterization backend.
 - Partial stats and reduction pipeline.
 - End-to-end pipeline entry points and benchmark hooks.
+
+## Installation
+
+Install the base package from PyPI:
+
+```bash
+pip install rayzon
+```
+
+Install optional extras as needed:
+
+```bash
+pip install "rayzon[xarray]"
+pip install "rayzon[geopandas]"
+pip install "rayzon[xarray,geopandas]"
+```
 
 ## Development
 
